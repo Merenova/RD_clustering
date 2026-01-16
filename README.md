@@ -94,8 +94,8 @@ L_RD = H(C) + β_e · D^(e) + β_a · D^(a)
 
 Where:
 - **H(C)** = -Σ_c P̄_c · log(P̄_c) — entropy (rate/compression term)
-- **D^(e)** = Σ_n P_n · ||e_n - μ_{c(n)}^(e)||² / d_e — semantic distortion
-- **D^(a)** = Σ_n P_n · ||a_n - μ_{c(n)}^(a)||² / d_a — attribution distortion
+- **D^(e)** = Σ_n P_n · ||e_n - μ_{c(n)}^(e)||² / d_e — semantic distortion (L2 loss)
+- **D^(a)** = Σ_n P_n · ||a_n - μ_{c(n)}^(a)|| / d_a — attribution distortion (L1 loss)
 - **β = β_e + β_a** — total precision (inverse temperature)
 - **γ = β_e / β** — view ratio (semantic vs attribution weighting)
 

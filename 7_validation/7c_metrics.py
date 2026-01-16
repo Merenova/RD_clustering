@@ -407,9 +407,7 @@ def aggregate_results_across_prefixes(
 
     Args:
         all_results: {prefix_id: {key: {mean_r2, mean_corr, ...}}}
-        sweep_keys: List of tuples to aggregate. Can be either:
-                   - 3-tuple: (method, hc_sel, top_B) for legacy format
-                   - 4-tuple: (method, hc_sel, top_B, h_c_strategy) for new format
+        sweep_keys: List of tuples to aggregate. Format: (method, hc_sel, top_B)
 
     Returns:
         {tuple_key: {r2: [], corr: [], spearman: [], win_r2: [], win_corr: [], win_spearman: [], logit_r2: [], logit_corr: [], logit_spearman: []}}
@@ -419,9 +417,6 @@ def aggregate_results_across_prefixes(
         'win_r2': [], 'win_corr': [], 'win_spearman': [],
         'logit_r2': [], 'logit_corr': [], 'logit_spearman': []
     } for key in sweep_keys}
-
-    # Determine if we're using 4-tuple keys (with h_c_strategy)
-    has_strategy = len(sweep_keys) > 0 and len(sweep_keys[0]) >= 4
 
     for prefix_id, prefix_results in all_results.items():
         results = prefix_results.get('results', {})
@@ -456,39 +451,26 @@ def format_summary_table(aggregated: Dict) -> str:
 
     Args:
         aggregated: Output from aggregate_results_across_prefixes
-                   Keys can be 3-tuple (method, hc_sel, top_B) or
-                   4-tuple (method, hc_sel, top_B, strategy)
+                   Keys are 3-tuples: (method, hc_sel, top_B)
 
     Returns:
         Formatted table string
     """
     lines = []
-    # Check if we have strategy in keys
     if not aggregated:
         return "No results to aggregate."
-
-    sample_key = next(iter(aggregated.keys()), ())
-    has_strategy = len(sample_key) >= 4
 
     # Check if logit metrics are present
     sample_metrics = next(iter(aggregated.values()), {})
     has_logit = 'logit_r2' in sample_metrics and sample_metrics.get('logit_r2')
 
     # Header with Spearman
-    if has_strategy:
-        if has_logit:
-            lines.append(f"\n{'Method':<12} {'H_c Sel':<9} {'B':<4} {'Strategy':<14} {'Corr':>7} {'Spear':>7} {'WinCorr':>7} {'WinSpear':>8} {'LogCorr':>8} {'LogSpear':>8} {'N':>4}")
-            lines.append("-" * 120)
-        else:
-            lines.append(f"\n{'Method':<12} {'H_c Sel':<9} {'B':<4} {'Strategy':<14} {'Corr':>7} {'Spear':>7} {'WinCorr':>7} {'WinSpear':>8} {'N':>4}")
-            lines.append("-" * 95)
+    if has_logit:
+        lines.append(f"\n{'Method':<15} {'H_c Sel':<10} {'Top-B':<6} {'Corr':>8} {'Spear':>8} {'WinCorr':>8} {'WinSpear':>8} {'LogCorr':>8} {'LogSpear':>8} {'N':>6}")
+        lines.append("-" * 115)
     else:
-        if has_logit:
-            lines.append(f"\n{'Method':<15} {'H_c Sel':<10} {'Top-B':<6} {'Corr':>8} {'Spear':>8} {'WinCorr':>8} {'WinSpear':>8} {'LogCorr':>8} {'LogSpear':>8} {'N':>6}")
-            lines.append("-" * 115)
-        else:
-            lines.append(f"\n{'Method':<15} {'H_c Sel':<10} {'Top-B':<6} {'Corr':>8} {'Spear':>8} {'WinCorr':>8} {'WinSpear':>8} {'N':>6}")
-            lines.append("-" * 85)
+        lines.append(f"\n{'Method':<15} {'H_c Sel':<10} {'Top-B':<6} {'Corr':>8} {'Spear':>8} {'WinCorr':>8} {'WinSpear':>8} {'N':>6}")
+        lines.append("-" * 85)
 
     # Collect rows with their metrics
     rows = []
@@ -508,16 +490,10 @@ def format_summary_table(aggregated: Dict) -> str:
     rows.sort(key=lambda x: x[2], reverse=True)  # x[2] is mean_spearman
 
     for sweep_key, mean_corr, mean_spearman, mean_win_corr, mean_win_spearman, mean_logit_corr, mean_logit_spearman, n in rows:
-        if sweep_key.has_strategy():
-            if has_logit:
-                lines.append(f"{sweep_key.method:<12} {sweep_key.hc_selection:<9} {sweep_key.top_B:<4} {sweep_key.h_c_strategy:<14} {mean_corr:>+7.4f} {mean_spearman:>+7.4f} {mean_win_corr:>+7.4f} {mean_win_spearman:>+8.4f} {mean_logit_corr:>+8.4f} {mean_logit_spearman:>+8.4f} {n:>4}")
-            else:
-                lines.append(f"{sweep_key.method:<12} {sweep_key.hc_selection:<9} {sweep_key.top_B:<4} {sweep_key.h_c_strategy:<14} {mean_corr:>+7.4f} {mean_spearman:>+7.4f} {mean_win_corr:>+7.4f} {mean_win_spearman:>+8.4f} {n:>4}")
+        if has_logit:
+            lines.append(f"{sweep_key.method:<15} {sweep_key.hc_selection:<10} {sweep_key.top_B:<6} {mean_corr:>+8.4f} {mean_spearman:>+8.4f} {mean_win_corr:>+8.4f} {mean_win_spearman:>+8.4f} {mean_logit_corr:>+8.4f} {mean_logit_spearman:>+8.4f} {n:>6}")
         else:
-            if has_logit:
-                lines.append(f"{sweep_key.method:<15} {sweep_key.hc_selection:<10} {sweep_key.top_B:<6} {mean_corr:>+8.4f} {mean_spearman:>+8.4f} {mean_win_corr:>+8.4f} {mean_win_spearman:>+8.4f} {mean_logit_corr:>+8.4f} {mean_logit_spearman:>+8.4f} {n:>6}")
-            else:
-                lines.append(f"{sweep_key.method:<15} {sweep_key.hc_selection:<10} {sweep_key.top_B:<6} {mean_corr:>+8.4f} {mean_spearman:>+8.4f} {mean_win_corr:>+8.4f} {mean_win_spearman:>+8.4f} {n:>6}")
+            lines.append(f"{sweep_key.method:<15} {sweep_key.hc_selection:<10} {sweep_key.top_B:<6} {mean_corr:>+8.4f} {mean_spearman:>+8.4f} {mean_win_corr:>+8.4f} {mean_win_spearman:>+8.4f} {n:>6}")
 
     return "\n".join(lines)
 
@@ -537,12 +513,8 @@ def save_aggregated_summary(
         sweeps: Sweep configurations
         output_path: Path to save JSON file
     """
-    # Check if we have strategy in keys
     if not aggregated:
         return
-
-    sample_key = next(iter(aggregated.keys()), ())
-    has_strategy = len(sample_key) >= 4
 
     summary_rows = []
     for key, metrics in aggregated.items():
@@ -567,8 +539,6 @@ def save_aggregated_summary(
                 row['mean_logit_corr'] = float(np.mean(metrics['logit_corr']))
             if metrics.get('logit_spearman'):
                 row['mean_logit_spearman'] = float(np.mean(metrics['logit_spearman']))
-            if sweep_key.has_strategy():
-                row['h_c_strategy'] = sweep_key.h_c_strategy
             summary_rows.append(row)
 
     # Sort by Spearman (most meaningful for non-linear relationships)
@@ -584,19 +554,7 @@ def save_aggregated_summary(
         json.dump(summary, f, indent=2)
 
 
-def generate_sweep_key(method: str, hc_sel: str, top_B: int, h_c_strategy: str = None) -> str:
-    """Generate a consistent key string for sweep configuration.
-
-    Args:
-        method: Steering method name
-        hc_sel: H_c selection mode
-        top_B: Number of top features
-        h_c_strategy: H_c strategy (optional, for backward compatibility)
-
-    Returns:
-        Key string like "multiplicative_full_B10" or "multiplicative_full_B10_Delta_H_c"
-    """
-    if h_c_strategy:
-        return f"{method}_{hc_sel}_B{top_B}_{h_c_strategy}"
+def generate_sweep_key(method: str, hc_sel: str, top_B: int) -> str:
+    """Generate a consistent key string for sweep configuration."""
     return f"{method}_{hc_sel}_B{top_B}"
 

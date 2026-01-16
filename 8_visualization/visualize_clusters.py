@@ -86,7 +86,8 @@ def load_prefix_data(prefix_id: str, results_dir: Path) -> dict:
         data['sweep'] = sweep
 
         # Find best config in grid
-        best = sweep.get('best', {})
+        grid = sweep.get('grid', [])
+        best = max(grid, key=lambda x: x.get('harmonic', -1)) if grid else {}
         best_beta, best_gamma = best.get('beta'), best.get('gamma')
 
         for entry in sweep.get('grid', []):
@@ -95,7 +96,7 @@ def load_prefix_data(prefix_id: str, results_dir: Path) -> dict:
                 break
 
     # Load steering results
-    steering_file = results_dir / "7_validation" / "7c_steering" / f"{prefix_id}_sweep_results.json"
+    steering_file = results_dir / "7_validation" / "7c_steering" / "H4a" / f"{prefix_id}_sweep_results.json"
     if steering_file.exists():
         with open(steering_file) as f:
             data['steering'] = json.load(f)

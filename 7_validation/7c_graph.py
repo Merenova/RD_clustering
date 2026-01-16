@@ -78,29 +78,12 @@ def load_attribution_context(
 # Semantic Graph Strategies
 # =============================================================================
 
-def compute_semantic_graphs_with_strategy(
+def compute_semantic_graphs(
     components: Dict[str, Any],
-    h_c_strategy: str = "Delta_H_c",
-    H_0: np.ndarray = None,
+    H_0: np.ndarray,
     logger=None
 ) -> Dict[int, np.ndarray]:
-    """Compute semantic graphs based on the specified strategy.
-
-    Strategies:
-        - "H_c": Full semantic graph = H_0 + Delta_H_c
-        - "Delta_H_c": Centered semantic graph = Delta_H_c (deviation from global mean)
-        - "H_c_centered": Cluster-centered = Delta_H_c - mean(Delta_H_c') (deviation from cluster mean)
-
-    Args:
-        components: Dict of {cluster_id_str: {"mu_a": [...], ...}}
-        h_c_strategy: Strategy name
-        H_0: Global mean attribution vector (required for "H_c" strategy)
-        logger: Optional logger
-
-    Returns:
-        Dict of {cluster_id: H_c_array}
-    """
-    # First, extract all Delta_H_c values
+    """Compute semantic graphs using H_c = H_0 + Delta_H_c."""
     delta_H_c_dict = {}
     for c_str, comp in components.items():
         c = int(c_str)
@@ -110,39 +93,15 @@ def compute_semantic_graphs_with_strategy(
     if not delta_H_c_dict:
         return {}
 
-    # Compute based on strategy
+    if H_0 is None:
+        raise ValueError("H_0 is required for H_c computation but was not provided")
+
     semantic_graphs = {}
+    for c, delta_H_c in delta_H_c_dict.items():
+        semantic_graphs[c] = H_0 + delta_H_c
 
-    if h_c_strategy == "H_c":
-        # Full semantic graph: H_c = H_0 + Delta_H_c
-        if H_0 is None:
-            raise ValueError("H_0 is required for 'H_c' strategy but was not provided")
-        else:
-            for c, delta_H_c in delta_H_c_dict.items():
-                semantic_graphs[c] = H_0 + delta_H_c
-            if logger:
-                logger.info(f"  Using H_c strategy: H_0 + Delta_H_c (||H_0||={np.linalg.norm(H_0):.4f})")
-
-    elif h_c_strategy == "H_c_centered":
-        # Cluster-centered: Delta_H_c - mean(Delta_H_c')
-        # This measures how different this cluster is from the average cluster
-        all_delta_H_c = np.stack(list(delta_H_c_dict.values()), axis=0)  # [K, n_features]
-        mean_delta_H_c = np.mean(all_delta_H_c, axis=0)  # [n_features]
-
-        for c, delta_H_c in delta_H_c_dict.items():
-            semantic_graphs[c] = delta_H_c - mean_delta_H_c
-
-        if logger:
-            logger.info(f"  Using H_c_centered strategy: Delta_H_c - mean(Delta_H_c') (||mean||={np.linalg.norm(mean_delta_H_c):.4f})")
-
-    elif h_c_strategy == "Delta_H_c":
-        # Centered semantic graph: just Delta_H_c
-        for c, delta_H_c in delta_H_c_dict.items():
-            semantic_graphs[c] = delta_H_c
-        if logger:
-            logger.info(f"  Using Delta_H_c strategy: centered semantic graph")
-    else:
-        raise ValueError(f"Unknown h_c_strategy: {h_c_strategy}")
+    if logger:
+        logger.info(f"  Using H_c strategy: H_0 + Delta_H_c (||H_0||={np.linalg.norm(H_0):.4f})")
 
     return semantic_graphs
 
@@ -348,7 +307,7 @@ def precompute_decoder_vectors_global(
     """Precompute decoder vectors for top features ONCE (shared across h_c_strategies).
 
     This is called once per prefix and cached. The decoder vectors only depend on
-    (layer, feat_id), not on h_c_strategy or cluster assignment.
+    (layer, feat_id), not on cluster assignment.
 
     Args:
         model: ReplacementModel with transcoders
@@ -398,7 +357,7 @@ def build_cluster_decoder_cache(
     """Build per-cluster decoder cache from global cache (fast - no model calls).
 
     This uses the precomputed global decoder cache to build per-cluster caches
-    based on H_c values. Called once per h_c_strategy (but very fast).
+    based on H_c values. Called once per clustering config (but very fast).
 
     Args:
         semantic_graphs: {cluster_id: H_c array}

@@ -18,8 +18,11 @@ from rd_objective import (
     binary_entropy,
     compute_entropy,
     compute_mse_distances,
+    compute_l1_distances,
     compute_mse_distance_to_center,
+    compute_l1_distance_to_center,
     compute_mse_distance_pairwise,
+    compute_l1_distance_pairwise,
     compute_component_variance,
 )
 
@@ -38,6 +41,9 @@ def pca_split_initialization(
 
     Optimized to avoid creating large concatenated arrays by computing
     covariance contributions from e and a separately.
+    
+    NOTE: PCA is inherently L2/Variance based. Even if we use L1 metric for clustering,
+    using PCA for initialization is a reasonable heuristic.
 
     Args:
         e_c: Semantic embeddings for component (n_c, d_e)
@@ -151,6 +157,8 @@ def split_operation(
     K_max: int,
     next_component_id: int,
     W_total: float,
+    metric_a: str = "l2",
+    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Split operation using exact rate-distortion criterion (optimized).
 
@@ -158,9 +166,7 @@ def split_operation(
     Split component c into (c1, c2) with mass fractions (α, 1-α) iff:
         β_e·ΔD^(e,red) + β_a·ΔD^(a,red) > P̄_c·H_binary(α)
 
-    Uses combined distance for 2-means: β_e||e_n-μ||² + β_a||a_n-μ||²
-
-    Optimized with numpy vectorization and reduced 2-means iterations.
+    Uses combined distance for 2-means: β_e·Dist(e) + β_a·Dist(a)
 
     Args:
         embeddings_e: Semantic embeddings (N, d_e)
@@ -176,6 +182,8 @@ def split_operation(
         K_max: Maximum number of components
         next_component_id: Next available component ID
         W_total: Total probability mass
+        metric_a: Attribution distance metric ("l2" or "l1")
+        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (updated_components, updated_assignments, next_component_id)
@@ -216,7 +224,7 @@ def split_operation(
         if W_c == 0:
             continue
 
-        # Initialize 2-means with PCA-guided split
+        # Initialize 2-means with PCA-guided split (using L2 as heuristic even for L1)
         labels, _ = pca_split_initialization(e_c, a_c, P_c, beta_e, beta_a)
 
         c1_mask = labels == 0
@@ -226,24 +234,43 @@ def split_operation(
             continue
 
         # Compute initial centroids from PCA split
+        # If unweighted, we should use unweighted centroids? 
+        # But for split initialization, weighted is fine as a start.
         W1 = np.sum(P_c[c1_mask])
         W2 = np.sum(P_c[c2_mask])
 
         if W1 == 0 or W2 == 0:
             continue
+            
+        # Helper to compute centroid
+        def get_centroid(data_chunk, weights_chunk, w_total, metric="l2"):
+             if use_weighted_distortion:
+                 center = np.sum(weights_chunk[:, None] * data_chunk, axis=0) / w_total
+             else:
+                 if metric == "l1":
+                     center = np.median(data_chunk, axis=0)
+                 else:
+                     center = np.mean(data_chunk, axis=0)
+             return center
 
-        mu1_e = np.sum(P_c[c1_mask, None] * e_c[c1_mask], axis=0) / W1
-        mu1_a = np.sum(P_c[c1_mask, None] * a_c[c1_mask], axis=0) / W1
-        mu2_e = np.sum(P_c[c2_mask, None] * e_c[c2_mask], axis=0) / W2
-        mu2_a = np.sum(P_c[c2_mask, None] * a_c[c2_mask], axis=0) / W2
+        mu1_e = get_centroid(e_c[c1_mask], P_c[c1_mask], W1, "l2")
+        mu1_a = get_centroid(a_c[c1_mask], P_c[c1_mask], W1, metric_a)
+        mu2_e = get_centroid(e_c[c2_mask], P_c[c2_mask], W2, "l2")
+        mu2_a = get_centroid(a_c[c2_mask], P_c[c2_mask], W2, metric_a)
+        
+        # Helper for distance
+        def get_dist(data, center, metric="l2"):
+            if metric == "l1":
+                return compute_l1_distance_to_center(data, center)
+            return compute_mse_distance_to_center(data, center)
 
         # Refine with 2-means iterations (reduced to 5 for speed)
         for _ in range(5):
-            # Compute R-D weighted MSE distances to both centers
-            d1 = (beta_e * compute_mse_distance_to_center(e_c, mu1_e) +
-                  beta_a * compute_mse_distance_to_center(a_c, mu1_a))
-            d2 = (beta_e * compute_mse_distance_to_center(e_c, mu2_e) +
-                  beta_a * compute_mse_distance_to_center(a_c, mu2_a))
+            # Compute R-D distances to both centers
+            d1 = (beta_e * get_dist(e_c, mu1_e, "l2") +
+                  beta_a * get_dist(a_c, mu1_a, metric_a))
+            d2 = (beta_e * get_dist(e_c, mu2_e, "l2") +
+                  beta_a * get_dist(a_c, mu2_a, metric_a))
 
             labels = (d2 < d1).astype(np.int32)
 
@@ -259,24 +286,21 @@ def split_operation(
             if W1 == 0 or W2 == 0:
                 break
 
-            mu1_e = np.sum(P_c[c1_mask, None] * e_c[c1_mask], axis=0) / W1
-            # L2-normalize embedding centers for spherical clustering
-            mu1_e_norm = np.linalg.norm(mu1_e)
-            if mu1_e_norm > 1e-10:
-                mu1_e = mu1_e / mu1_e_norm
-            mu1_a = np.sum(P_c[c1_mask, None] * a_c[c1_mask], axis=0) / W1
-            mu2_e = np.sum(P_c[c2_mask, None] * e_c[c2_mask], axis=0) / W2
-            # L2-normalize embedding centers for spherical clustering
-            mu2_e_norm = np.linalg.norm(mu2_e)
-            if mu2_e_norm > 1e-10:
-                mu2_e = mu2_e / mu2_e_norm
-            mu2_a = np.sum(P_c[c2_mask, None] * a_c[c2_mask], axis=0) / W2
+            mu1_e = get_centroid(e_c[c1_mask], P_c[c1_mask], W1, "l2")
+            if np.linalg.norm(mu1_e) > 1e-10: mu1_e /= np.linalg.norm(mu1_e)
+            
+            mu1_a = get_centroid(a_c[c1_mask], P_c[c1_mask], W1, metric_a)
+            
+            mu2_e = get_centroid(e_c[c2_mask], P_c[c2_mask], W2, "l2")
+            if np.linalg.norm(mu2_e) > 1e-10: mu2_e /= np.linalg.norm(mu2_e)
+            
+            mu2_a = get_centroid(a_c[c2_mask], P_c[c2_mask], W2, metric_a)
 
         # Final assignment
-        d1 = (beta_e * compute_mse_distance_to_center(e_c, mu1_e) +
-              beta_a * compute_mse_distance_to_center(a_c, mu1_a))
-        d2 = (beta_e * compute_mse_distance_to_center(e_c, mu2_e) +
-              beta_a * compute_mse_distance_to_center(a_c, mu2_a))
+        d1 = (beta_e * get_dist(e_c, mu1_e, "l2") +
+              beta_a * get_dist(a_c, mu1_a, metric_a))
+        d2 = (beta_e * get_dist(e_c, mu2_e, "l2") +
+              beta_a * get_dist(a_c, mu2_a, metric_a))
         labels = (d2 < d1).astype(np.int32)
 
         c1_mask = labels == 0
@@ -291,10 +315,10 @@ def split_operation(
         alpha = W1 / (W1 + W2)
 
         # Compute post-split variances using helper function
-        var1_e = compute_component_variance(e_c[c1_mask], mu1_e, P_c[c1_mask], W1)
-        var2_e = compute_component_variance(e_c[c2_mask], mu2_e, P_c[c2_mask], W2)
-        var1_a = compute_component_variance(a_c[c1_mask], mu1_a, P_c[c1_mask], W1)
-        var2_a = compute_component_variance(a_c[c2_mask], mu2_a, P_c[c2_mask], W2)
+        var1_e = compute_component_variance(e_c[c1_mask], mu1_e, P_c[c1_mask], W1, "l2", use_weighted_distortion)
+        var2_e = compute_component_variance(e_c[c2_mask], mu2_e, P_c[c2_mask], W2, "l2", use_weighted_distortion)
+        var1_a = compute_component_variance(a_c[c1_mask], mu1_a, P_c[c1_mask], W1, metric_a, use_weighted_distortion)
+        var2_a = compute_component_variance(a_c[c2_mask], mu2_a, P_c[c2_mask], W2, metric_a, use_weighted_distortion)
 
         # Pre-split variances
         var_c_e = Var_e.get(c, 0)
@@ -353,6 +377,8 @@ def junk_operation(
     beta_e: float,
     beta_a: float,
     W_total: float,
+    metric_a: str = "l2",
+    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int]]:
     """Junk operation using exact rate-distortion criterion.
 
@@ -376,6 +402,8 @@ def junk_operation(
         beta_e: Semantic distortion weight
         beta_a: Attribution distortion weight
         W_total: Total probability mass
+        metric_a: Attribution metric
+        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (updated_components, updated_assignments)
@@ -409,8 +437,7 @@ def junk_operation(
         if len(indices) == 0:
             continue
 
-        # Find reassignments using full R-D assignment rule (tex Algorithm 3 lines 3-5)
-        # c'(n) = argmin_{c' ≠ c} [-log P̄_c' + β_e||e_n - μ_c'^(e)||² + β_a||a_n - μ_c'^(a)||²]
+        # Find reassignments using full R-D assignment rule
         other_components = [c_other for c_other in new_components.keys()
                           if c_other != c and c_other not in junked]
 
@@ -421,77 +448,90 @@ def junk_operation(
         mu_c_e = new_components[c]['mu_e']
         mu_c_a = new_components[c]['mu_a']
 
-        # Extract embeddings for this component's samples: (n_c, d_e) and (n_c, d_a)
+        # Extract embeddings for this component's samples
         e_c = embeddings_e[indices]
         a_c = attributions_a[indices]
         P_c = path_probs[indices]
 
-        # Stack other component centers: (K', d_e) and (K', d_a)
+        # Stack other component centers
         centers_e = np.array([new_components[c_prime]['mu_e'] for c_prime in other_components])
         centers_a = np.array([new_components[c_prime]['mu_a'] for c_prime in other_components])
         rate_costs = np.array([-np.log(P_bar.get(c_prime, eps) + eps) for c_prime in other_components])
 
-        # Compute MSE-normalized squared distances using helper functions
-        dist_e_sq = compute_mse_distances(e_c, centers_e)  # (n_c, K')
-        dist_a_sq = compute_mse_distances(a_c, centers_a)  # (n_c, K')
+        # Compute distances
+        dist_e_sq = compute_mse_distances(e_c, centers_e)
+        if metric_a == "l1":
+            dist_a = compute_l1_distances(a_c, centers_a)
+        else:
+            dist_a = compute_mse_distances(a_c, centers_a)
 
-        # Total R-D cost: (n_c, K')
-        total_cost = rate_costs[np.newaxis, :] + beta_e * dist_e_sq + beta_a * dist_a_sq
+        # Total R-D cost
+        total_cost = rate_costs[np.newaxis, :] + beta_e * dist_e_sq + beta_a * dist_a
 
-        # Find best reassignment for each sample: (n_c,)
+        # Find best reassignment
         best_idx = np.argmin(total_cost, axis=1)
 
         # Compute distortion cost of reassignment
-        # ΔD = Σ P_n/W_total (||x_n - μ_{c'(n)}||²/d - ||x_n - μ_c||²/d)
-        dist_to_current_e = compute_mse_distance_to_center(e_c, mu_c_e)
-        dist_to_current_a = compute_mse_distance_to_center(a_c, mu_c_a)
+        # Helper for scalar dist
+        def get_dist_to_center(data, center, metric="l2"):
+            if metric == "l1":
+                return compute_l1_distance_to_center(data, center)
+            return compute_mse_distance_to_center(data, center)
+            
+        def get_dist_pairwise(data, centers_arr, metric="l2"):
+            if metric == "l1":
+                return compute_l1_distance_pairwise(data, centers_arr)
+            return compute_mse_distance_pairwise(data, centers_arr)
 
-        # MSE distance to reassigned centers (each sample has its own reassigned center)
-        dist_to_new_e = compute_mse_distance_pairwise(e_c, centers_e[best_idx])
-        dist_to_new_a = compute_mse_distance_pairwise(a_c, centers_a[best_idx])
+        dist_to_current_e = get_dist_to_center(e_c, mu_c_e, "l2")
+        dist_to_current_a = get_dist_to_center(a_c, mu_c_a, metric_a)
+
+        dist_to_new_e = get_dist_pairwise(e_c, centers_e[best_idx], "l2")
+        dist_to_new_a = get_dist_pairwise(a_c, centers_a[best_idx], metric_a)
 
         # Weighted distortion change
-        weights = P_c / W_total
-        delta_D_e = float(np.sum(weights * (dist_to_new_e - dist_to_current_e)))
-        delta_D_a = float(np.sum(weights * (dist_to_new_a - dist_to_current_a)))
+        if use_weighted_distortion:
+            weights = P_c / W_total
+            delta_D_e = float(np.sum(weights * (dist_to_new_e - dist_to_current_e)))
+            delta_D_a = float(np.sum(weights * (dist_to_new_a - dist_to_current_a)))
+        else:
+            # Unweighted distortion (weighted by count fraction N_c/N implicitly in formula)
+            # D = sum (N_c/N) * mean_dist_c
+            # Delta D = sum (1/N) * (dist_new - dist_old)
+            n_samples = len(embeddings_e)
+            delta_D_e = float(np.sum((1/n_samples) * (dist_to_new_e - dist_to_current_e)))
+            delta_D_a = float(np.sum((1/n_samples) * (dist_to_new_a - dist_to_current_a)))
 
-        # Compute rate savings (tex Algorithm 3 line 13)
-        # |ΔH| = entropy_before - entropy_after
-        # This is positive because removing a component reduces entropy
-
-        # Current entropy
+        # Compute rate savings
         H_before = compute_entropy(P_bar)
 
         # Entropy after removing c and redistributing mass
         P_bar_after = {}
 
-        # Vectorized additional mass computation per component
-        # best_idx tells us which other_component each sample goes to
+        # Vectorized additional mass computation
         for i_other, c_other in enumerate(other_components):
             W_c_other = new_components[c_other]['W_c']
-            # Mask for samples reassigned to c_other
             mask_to_c_other = best_idx == i_other
             additional_mass = float(np.sum(P_c[mask_to_c_other]))
             P_bar_after[c_other] = (W_c_other + additional_mass) / W_total
 
         H_after = compute_entropy(P_bar_after)
-        delta_H = H_before - H_after  # Rate savings (positive)
+        delta_H = H_before - H_after
 
-        # Junk criterion: rate savings > distortion cost
+        # Junk criterion
         distortion_cost = beta_e * delta_D_e + beta_a * delta_D_a
 
         if delta_H > distortion_cost:
-            # Apply junk - vectorized assignment update
+            # Apply junk
             reassign_ids = np.array([other_components[i] for i in best_idx])
             new_assignments_arr[indices] = reassign_ids
 
-            # Remove component c
             if c in new_components:
                 del new_components[c]
 
             junked.add(c)
 
-            # Recompute centers and masses for affected components (vectorized)
+            # Recompute centers and masses for affected components
             for c_prime in other_components:
                 if c_prime not in new_components:
                     continue
@@ -505,15 +545,25 @@ def junk_operation(
                 W_c_prime = float(np.sum(P_c_prime))
 
                 if W_c_prime > 0:
-                    mu_e_new = np.sum(P_c_prime[:, None] * embeddings_e[idx_c_prime], axis=0) / W_c_prime
-                    # L2-normalize embedding center for spherical clustering
+                    if use_weighted_distortion:
+                        mu_e_new = np.sum(P_c_prime[:, None] * embeddings_e[idx_c_prime], axis=0) / W_c_prime
+                    else:
+                        mu_e_new = np.mean(embeddings_e[idx_c_prime], axis=0)
+                        
                     mu_e_norm = np.linalg.norm(mu_e_new)
                     if mu_e_norm > 1e-10:
                         mu_e_new = mu_e_new / mu_e_norm
+                        
+                    if metric_a == "l1":
+                        mu_a_new = np.median(attributions_a[idx_c_prime], axis=0)
+                    else:
+                        if use_weighted_distortion:
+                             mu_a_new = np.sum(P_c_prime[:, None] * attributions_a[idx_c_prime], axis=0) / W_c_prime
+                        else:
+                             mu_a_new = np.mean(attributions_a[idx_c_prime], axis=0)
+
                     new_components[c_prime]['mu_e'] = mu_e_new
-                    new_components[c_prime]['mu_a'] = (
-                        np.sum(P_c_prime[:, None] * attributions_a[idx_c_prime], axis=0) / W_c_prime
-                    )
+                    new_components[c_prime]['mu_a'] = mu_a_new
                     new_components[c_prime]['W_c'] = W_c_prime
                     new_components[c_prime]['indices'] = idx_c_prime.tolist()
 
@@ -533,6 +583,8 @@ def apply_adaptive_control(
     beta_a: float,
     K_max: int,
     next_component_id: int,
+    metric_a: str = "l2",
+    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Apply all adaptive control operations in sequence.
 
@@ -552,6 +604,8 @@ def apply_adaptive_control(
         beta_a: Attribution distortion weight
         K_max: Maximum components
         next_component_id: Next available component ID
+        metric_a: Metric for attribution
+        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (components, assignments, next_component_id)
@@ -564,7 +618,8 @@ def apply_adaptive_control(
     components, assignments, next_component_id = split_operation(
         embeddings_e, attributions_a, path_probs, assignments,
         components, P_bar, Var_e, Var_a, beta_e, beta_a,
-        K_max, next_component_id, W_total
+        K_max, next_component_id, W_total,
+        metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
     )
 
     # Recompute P_bar and variances after split
@@ -580,22 +635,25 @@ def apply_adaptive_control(
         mask_c = assignments_arr == c
         indices = np.where(mask_c)[0]
         W_c_val = W_c.get(c, 0)
-        if len(indices) == 0 or W_c_val == 0:
+        if len(indices) == 0:
             Var_e[c] = 0.0
             Var_a[c] = 0.0
             continue
 
         Var_e[c] = compute_component_variance(
-            embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val
+            embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val,
+            "l2", use_weighted_distortion
         )
         Var_a[c] = compute_component_variance(
-            attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val
+            attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val,
+            metric_a, use_weighted_distortion
         )
 
     # 2. Junk operation
     components, assignments = junk_operation(
         embeddings_e, attributions_a, path_probs, assignments,
-        components, P_bar, beta_e, beta_a, W_total
+        components, P_bar, beta_e, beta_a, W_total,
+        metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
     )
 
     return components, assignments, next_component_id
@@ -666,9 +724,15 @@ if __name__ == "__main__":
 
     print(f"\nAfter adaptive control:")
     print(f"  Components: {len(updated_components)}")
-    print(f"  Next component ID: {next_id}")
-
-    for c, comp in updated_components.items():
-        print(f"  Component {c}: {len(comp.get('indices', []))} samples, W_c={comp['W_c']:.4f}")
+    
+    # Test L1 Unweighted
+    print("\nTesting L1 Unweighted adaptive control...")
+    updated_components_l1, _, _ = apply_adaptive_control(
+        embeddings_e, attributions_a, path_probs, assignments,
+        components, P_bar, Var_e, Var_a,
+        beta_e, beta_a, K_max, next_component_id=2,
+        metric_a="l1", use_weighted_distortion=False
+    )
+    print(f"  Components (L1 Unweighted): {len(updated_components_l1)}")
 
     print("\nAdaptive control test passed!")

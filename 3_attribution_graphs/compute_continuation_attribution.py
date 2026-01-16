@@ -4,7 +4,7 @@
 This is Stage 3 in the latent_planning pipeline. It:
 1. Loads branch sampling results from Stage 2
 2. Computes attribution from prefix components to continuation tokens
-3. Aggregates attributions according to span_mode (full, lcs_plus_one, post_lcs)
+3. Aggregates attributions over the full continuation span
 4. Saves prefix context and aggregated attributions for downstream stages
 """
 
@@ -32,69 +32,6 @@ from utils.config import PathConfig
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger
 from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
-
-
-def compute_lcs_length(cont1: List[int], cont2: List[int]) -> int:
-    """Compute longest common prefix length between two token sequences."""
-    for i, (a, b) in enumerate(zip(cont1, cont2)):
-        if a != b:
-            return i
-    return min(len(cont1), len(cont2))
-
-
-def get_min_distinguishing_index(
-    target_idx: int,
-    all_continuations: List[List[int]],
-) -> int:
-    """Find earliest index where target differs from all others.
-
-    Returns the length of the longest common prefix between the target
-    continuation and any other continuation. This is the first position
-    where the target becomes distinguishable from ALL other continuations.
-    """
-    target = all_continuations[target_idx]
-    max_lcs = 0  # Track the longest common prefix with any other
-
-    for i, other in enumerate(all_continuations):
-        if i != target_idx:
-            lcs = compute_lcs_length(target, other)
-            max_lcs = max(max_lcs, lcs)
-
-    return max_lcs
-
-
-def get_span_indices(
-    cont_idx: int,
-    all_continuations: List[List[int]],
-    span_mode: str,
-) -> Tuple[int, int]:
-    """Get (start, end) indices for attribution span.
-
-    Args:
-        cont_idx: Index of the target continuation
-        all_continuations: List of all continuation token sequences
-        span_mode: One of "full", "lcs_plus_one", "post_lcs"
-
-    Returns:
-        Tuple of (start_idx, end_idx) for slicing token attributions
-    """
-    n = len(all_continuations[cont_idx])
-
-    if span_mode == "full":
-        return 0, n
-
-    # Find the distinguishing index
-    min_distinguishing_index = get_min_distinguishing_index(cont_idx, all_continuations)
-
-    if span_mode == "lcs_plus_one":
-        # Attribute from start up to and including the distinguishing token
-        return 0, min(min_distinguishing_index + 1, n)
-    elif span_mode == "post_lcs":
-        # Attribute from distinguishing token onwards
-        return min(min_distinguishing_index, n - 1), n
-
-    # Default to full
-    return 0, n
 
 
 def aggregate_attributions(
@@ -126,7 +63,6 @@ def process_prefix(
     prefix_id: str,
     branches_data: Dict[str, Any],
     model: ReplacementModel,
-    span_mode: str,
     max_feature_nodes: int,
     batch_size: int,
     output_dir: Path,
@@ -139,7 +75,6 @@ def process_prefix(
         prefix_id: Unique identifier for the prefix
         branches_data: Branch sampling data from Stage 2
         model: ReplacementModel for attribution
-        span_mode: Attribution span mode (full, lcs_plus_one, post_lcs)
         max_feature_nodes: Maximum number of prefix features to include
         batch_size: How many continuation tokens to process per backward pass
         output_dir: Directory for output files
@@ -213,13 +148,13 @@ def process_prefix(
     logger.info(f"    Total prefix sources: {result.prefix_context.n_prefix_sources}")
 
     # Aggregate attributions by span mode (or store all for deferred processing)
-    logger.info(f"  Processing attributions (span_mode={span_mode}, store_all={store_all})...")
+    logger.info(f"  Processing attributions (span_mode=full, store_all={store_all})...")
     aggregated = []
     token_level_attributions = [] if store_all else None  # Only collect if store_all=True
     span_info = []
 
     for i, token_attrs in enumerate(result.continuation_attributions):
-        start, end = get_span_indices(i, all_continuations, span_mode)
+        start, end = 0, len(token_attrs)
         agg = aggregate_attributions(token_attrs, start, end)
         aggregated.append(agg)
 
@@ -279,7 +214,7 @@ def process_prefix(
     # Save metadata as JSON (for easy inspection, no large tensors)
     attribution_data = {
         "prefix_id": prefix_id,
-        "span_mode": span_mode,
+        "span_mode": "full",
         "store_all": store_all,
         "n_continuations": n_continuations,
         "n_prefix_sources": prefix_ctx.n_prefix_sources,
@@ -323,13 +258,6 @@ def main():
         default="bfloat16",
         choices=["float32", "float16", "bfloat16"],
         help="Data type for model (bfloat16 uses half the memory of float32)"
-    )
-    parser.add_argument(
-        "--span-mode",
-        type=str,
-        default="full",
-        choices=["full", "lcs_plus_one", "post_lcs"],
-        help="Attribution span mode: full (all tokens), lcs_plus_one (up to distinguishing), post_lcs (after distinguishing)"
     )
     parser.add_argument(
         "--max-feature-nodes",
@@ -385,7 +313,7 @@ def main():
     logger.info(f"Model: {args.model}")
     logger.info(f"Transcoder: {args.transcoder}")
     logger.info(f"Dtype: {args.dtype}")
-    logger.info(f"Span mode: {args.span_mode}")
+    logger.info("Span mode: full")
     logger.info(f"Store all: {args.store_all}")
     logger.info(f"Max feature nodes: {args.max_feature_nodes}")
     logger.info(f"Batch size: {args.batch_size}")
@@ -473,7 +401,6 @@ def main():
                 prefix_id,
                 branches_data,
                 model,
-                args.span_mode,
                 args.max_feature_nodes,
                 args.batch_size,
                 args.output_dir,
@@ -493,7 +420,7 @@ def main():
     index_data = {
         "model": args.model,
         "transcoder": args.transcoder,
-        "span_mode": args.span_mode,
+        "span_mode": "full",
         "store_all": args.store_all,
         "max_feature_nodes": args.max_feature_nodes,
         "n_prefixes_processed": len(completed_ids),

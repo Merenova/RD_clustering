@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
 sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 
-from circuit_tracer.graph import Graph
 from utils.config import PathConfig
 from utils.data_utils import load_json, save_json, save_torch, reconstruct_active_features
 from utils.logging_utils import setup_logger, get_log_path
@@ -353,19 +352,19 @@ def main():
     logger.info(f"Attribution graphs dir: {args.attribution_graphs_dir}")
     logger.info(f"Output dir: {args.output_dir}")
 
-    # Find all clustering result files
-    clustering_files = sorted(args.clustering_dir.glob("*_clustering.json"))
-    logger.info(f"\nFound {len(clustering_files)} clustering results")
+    # Find all clustering sweep result files
+    clustering_files = sorted(args.clustering_dir.glob("*_sweep_results.json"))
+    logger.info(f"\nFound {len(clustering_files)} sweep results")
 
     # Filter based on Stage 5 manifest
     results_dir = paths.results
-    all_prefix_ids = [f.stem.replace("_clustering", "") for f in clustering_files]
+    all_prefix_ids = [f.stem.replace("_sweep_results", "") for f in clustering_files]
     available_ids, skipped_ids = filter_samples_by_manifest(
         all_prefix_ids, results_dir, "stage5", logger
     )
     # Filter clustering files to only available ones
     available_id_set = set(available_ids)
-    clustering_files = [f for f in clustering_files if f.stem.replace("_clustering", "") in available_id_set]
+    clustering_files = [f for f in clustering_files if f.stem.replace("_sweep_results", "") in available_id_set]
     logger.info(f"Processing {len(clustering_files)} available results (skipped {len(skipped_ids)})")
 
     # Process each file
@@ -384,12 +383,12 @@ def main():
         iterator = tqdm(clustering_files, desc="Extracting graphs")
 
     for clustering_file in iterator:
-        prefix_id = clustering_file.stem.replace("_clustering", "")
+        prefix_id = clustering_file.stem.replace("_sweep_results", "")
         logger.info(f"\nProcessing: {prefix_id}")
 
         try:
-            # Load clustering result
-            clustering_result = load_json(clustering_file)
+            # Load clustering sweep results
+            clustering_sweep = load_json(clustering_file)
 
             # Load branch samples data
             branches_file = args.samples_dir / f"{prefix_id}_branches.json"
@@ -412,85 +411,112 @@ def main():
                 errors[prefix_id] = f"FileNotFoundError: {attribution_graph_file}"
                 continue
 
-            # Extract semantic graphs
-            graphs_data = extract_semantic_graphs(
-                clustering_result,
-                branches_data,
-                attribution_graph_file,
-                logger
-            )
+            grid_results = clustering_sweep.get("grid", [])
+            valid_grid = [
+                entry for entry in grid_results
+                if entry.get("components") and entry.get("assignments") and "error" not in entry
+            ]
+            if not valid_grid:
+                logger.warning(f"  No valid clustering results for {prefix_id}")
+                failed_ids.append(prefix_id)
+                errors[prefix_id] = "No valid clustering results"
+                continue
 
-            logger.info(f"  Components: {len(graphs_data['component_ids'])}")
-            logger.info(f"  Unique tokens: {len(graphs_data['token_scores'])}")
+            processed_any = False
+            for grid_entry in valid_grid:
+                beta = grid_entry.get("beta")
+                gamma = grid_entry.get("gamma")
+                clustering_key = f"beta{beta}_gamma{gamma}"
+                clustering_result = {
+                    "components": grid_entry.get("components", {}),
+                    "assignments": grid_entry.get("assignments", []),
+                    "H_0": clustering_sweep.get("H_0"),
+                }
 
-            # Save graphs (as PyTorch .pt file, consistent with knowledge_attribution)
-            output_file_pt = args.output_dir / f"{prefix_id}_semantic_graphs.pt"
-            save_torch(graphs_data, output_file_pt)
-            logger.info(f"  Saved to: {output_file_pt}")
+                # Extract semantic graphs
+                graphs_data = extract_semantic_graphs(
+                    clustering_result,
+                    branches_data,
+                    attribution_graph_file,
+                    logger
+                )
 
-            # Also save JSON summary
-            output_file_json = args.output_dir / f"{prefix_id}_semantic_graphs.json"
+                logger.info(f"  Components ({clustering_key}): {len(graphs_data['component_ids'])}")
+                logger.info(f"  Unique tokens ({clustering_key}): {len(graphs_data['token_scores'])}")
 
-            # Compute soft membership stats if available
-            soft_membership_stats = {}
-            if graphs_data["soft_node_memberships"] is not None and len(graphs_data["soft_node_memberships"]) > 0:
-                sigma = graphs_data["soft_node_memberships"]
-                soft_membership_stats = {
-                    "shape": list(sigma.shape),
-                    "max_membership_per_node": {
-                        "mean": float(np.max(sigma, axis=0).mean()),
-                        "min": float(np.max(sigma, axis=0).min()),
-                        "max": float(np.max(sigma, axis=0).max()),
+                # Save graphs (as PyTorch .pt file, consistent with knowledge_attribution)
+                output_file_pt = args.output_dir / f"{prefix_id}_{clustering_key}_semantic_graphs.pt"
+                save_torch(graphs_data, output_file_pt)
+                logger.info(f"  Saved to: {output_file_pt}")
+
+                # Also save JSON summary
+                output_file_json = args.output_dir / f"{prefix_id}_{clustering_key}_semantic_graphs.json"
+                # Compute soft membership stats if available
+                soft_membership_stats = {}
+                if graphs_data["soft_node_memberships"] is not None and len(graphs_data["soft_node_memberships"]) > 0:
+                    sigma = graphs_data["soft_node_memberships"]
+                    soft_membership_stats = {
+                        "shape": list(sigma.shape),
+                        "max_membership_per_node": {
+                            "mean": float(np.max(sigma, axis=0).mean()),
+                            "min": float(np.max(sigma, axis=0).min()),
+                            "max": float(np.max(sigma, axis=0).max()),
+                        },
+                    }
+
+                # Feature mapping info for JSON summary
+                feature_mapping_info = {
+                    "n_features": graphs_data["n_features"],
+                    "n_error_nodes": graphs_data["n_error_nodes"],
+                    "n_token_nodes": graphs_data["n_token_nodes"],
+                    "has_active_features": graphs_data["active_features"] is not None,
+                }
+                if graphs_data["active_features"] is not None:
+                    feature_mapping_info["active_features_shape"] = list(graphs_data["active_features"].shape)
+
+                # Prepare H_0 for JSON
+                H_0_json = None
+                if graphs_data["H_0"] is not None:
+                    H_0_json = {
+                        "norm": float(np.linalg.norm(graphs_data["H_0"])),
+                        "shape": list(graphs_data["H_0"].shape),
+                    }
+
+                graphs_data_json = {
+                    "prefix_id": prefix_id,
+                    "prefix": clustering_sweep.get("prefix", ""),
+                    "clustering_key": clustering_key,
+                    "beta": beta,
+                    "gamma": gamma,
+                    "n_components": len(graphs_data["component_ids"]),
+                    "component_ids": graphs_data["component_ids"],
+                    "n_tokens": len(graphs_data["token_scores"]),
+                    # Hierarchical decomposition
+                    "H_0": H_0_json,
+                    "semantic_graphs_shape": {
+                        str(c): list(H.shape) for c, H in graphs_data["semantic_graphs"].items()
                     },
+                    "feature_mapping": feature_mapping_info,
+                    "soft_node_memberships": soft_membership_stats,
+                    "token_scores": {
+                        str(token): {str(c): float(score) for c, score in scores.items()}
+                        for token, scores in graphs_data["token_scores"].items()
+                    },
+                    "attribution_reconstruction_errors": {
+                        str(token): float(error)
+                        for token, error in graphs_data["attribution_reconstruction_errors"].items()
+                    },
+                    "reconstruction_error_stats": {
+                        "mean": float(np.mean(list(graphs_data["attribution_reconstruction_errors"].values()))),
+                        "max": float(np.max(list(graphs_data["attribution_reconstruction_errors"].values()))),
+                        "min": float(np.min(list(graphs_data["attribution_reconstruction_errors"].values()))),
+                    } if len(graphs_data["attribution_reconstruction_errors"]) > 0 else {},
                 }
+                save_json(graphs_data_json, output_file_json)
+                processed_any = True
 
-            # Feature mapping info for JSON summary
-            feature_mapping_info = {
-                "n_features": graphs_data["n_features"],
-                "n_error_nodes": graphs_data["n_error_nodes"],
-                "n_token_nodes": graphs_data["n_token_nodes"],
-                "has_active_features": graphs_data["active_features"] is not None,
-            }
-            if graphs_data["active_features"] is not None:
-                feature_mapping_info["active_features_shape"] = list(graphs_data["active_features"].shape)
-
-            # Prepare H_0 for JSON
-            H_0_json = None
-            if graphs_data["H_0"] is not None:
-                H_0_json = {
-                    "norm": float(np.linalg.norm(graphs_data["H_0"])),
-                    "shape": list(graphs_data["H_0"].shape),
-                }
-
-            graphs_data_json = {
-                "prefix_id": prefix_id,
-                "prefix": clustering_result["prefix"],
-                "n_components": len(graphs_data["component_ids"]),
-                "component_ids": graphs_data["component_ids"],
-                "n_tokens": len(graphs_data["token_scores"]),
-                # Hierarchical decomposition
-                "H_0": H_0_json,
-                "semantic_graphs_shape": {
-                    str(c): list(H.shape) for c, H in graphs_data["semantic_graphs"].items()
-                },
-                "feature_mapping": feature_mapping_info,
-                "soft_node_memberships": soft_membership_stats,
-                "token_scores": {
-                    str(token): {str(c): float(score) for c, score in scores.items()}
-                    for token, scores in graphs_data["token_scores"].items()
-                },
-                "attribution_reconstruction_errors": {
-                    str(token): float(error)
-                    for token, error in graphs_data["attribution_reconstruction_errors"].items()
-                },
-                "reconstruction_error_stats": {
-                    "mean": float(np.mean(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                    "max": float(np.max(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                    "min": float(np.min(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                } if len(graphs_data["attribution_reconstruction_errors"]) > 0 else {},
-            }
-            save_json(graphs_data_json, output_file_json)
-            completed_ids.append(prefix_id)
+            if processed_any:
+                completed_ids.append(prefix_id)
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"

@@ -67,7 +67,7 @@ def run_single_prefix_profiled(
     """Run profiled steering on a single prefix."""
     stage_7c = config.get("stage_7c_steering", {})
     max_seq_len = config.get("global", {}).get("max_seq_len", 64)
-    h_c_strategy = stage_7c.get("h_c_strategy", "H_c_centered")
+    h_c_strategy = "H_c"
     device = model.cfg.device
 
     print(f"\nConfig: h_c_strategy={h_c_strategy}")
@@ -82,8 +82,8 @@ def run_single_prefix_profiled(
 
     # Build semantic graphs with strategy
     with profiler.timed("compute_semantic_graphs"):
-        semantic_graphs = graph.compute_semantic_graphs_with_strategy(
-            components, h_c_strategy, H_0, logger=None
+        semantic_graphs = graph.compute_semantic_graphs(
+            components, H_0, logger=None
         )
     print(f"  Built semantic graphs for {len(semantic_graphs)} clusters")
 

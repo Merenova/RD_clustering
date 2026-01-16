@@ -4,7 +4,6 @@ Provides functions for:
 - Running (beta, gamma) grid search with parallel processing
 - Computing silhouette scores for clustering quality
 - Finding Pareto-optimal configurations
-- Selecting best configuration based on harmonic mean or Pareto front
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -110,46 +109,18 @@ def find_pareto_front(results: List[Dict], keys: List[str] = ["D_e", "D_a"]) -> 
     return pareto
 
 
-def select_best_config(sweep_results: Dict, method: str = "harmonic") -> Dict:
-    """Select best configuration from sweep results.
-
-    Args:
-        sweep_results: Dict with "grid" key containing list of results
-        method: "harmonic" for max harmonic score, "pareto" for Pareto front selection
-
-    Returns:
-        Best configuration dict
-    """
-    grid = sweep_results.get("grid", [])
-    if not grid:
-        return {}
-
-    if method == "harmonic":
-        best = max(grid, key=lambda x: x.get("harmonic", -1))
-    elif method == "pareto":
-        pareto_points = find_pareto_front(grid, keys=["D_e", "D_a"])
-        if pareto_points:
-            best = max(pareto_points, key=lambda x: x.get("harmonic", -1))
-        else:
-            best = max(grid, key=lambda x: x.get("harmonic", -1))
-    else:
-        best = max(grid, key=lambda x: x.get("harmonic", -1))
-
-    return best
-
-
 def _run_single_config(args_tuple):
     """Worker function for parallel sweep execution.
 
     Runs clustering for a single (beta, gamma) configuration.
 
     Args:
-        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold)
+        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion)
 
     Returns:
         Dict with beta, gamma, and clustering metrics
     """
-    data, beta, gamma, K_max, max_iterations, convergence_threshold = args_tuple
+    data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion = args_tuple
 
     # Compute beta_e, beta_a
     beta_e = gamma * beta
@@ -165,7 +136,7 @@ def _run_single_config(args_tuple):
         from initialize import initialize_single_component
         from em_loop import run_em_iteration, check_convergence
         from adaptive_control import apply_adaptive_control
-        from rd_objective import compute_full_rd_statistics, compute_component_masses
+        from rd_objective import compute_full_rd_statistics, compute_component_masses, compute_component_variance
 
         embeddings_e = data["embeddings_e"].copy()
         attributions_a = data["attributions_a"].copy()
@@ -179,11 +150,22 @@ def _run_single_config(args_tuple):
         next_component_id = max(components.keys()) + 1 if components else 2
         L_RD_prev = np.inf
 
+        # Track history
+        history = {
+            "iterations": [],
+            "n_components": [],
+            "L_RD": [],
+            "H": [],
+            "D_e": [],
+            "D_a": [],
+        }
+
         # EM loop
         for iteration in range(max_iterations):
             assignments, components, rd_stats = run_em_iteration(
                 embeddings_e, attributions_a, path_probs,
-                components, beta_e, beta_a
+                components, beta_e, beta_a,
+                metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
             )
 
             L_RD_curr = rd_stats['L_RD']
@@ -198,27 +180,42 @@ def _run_single_config(args_tuple):
                 for c, comp in components.items():
                     indices = [i for i, a in enumerate(assignments) if a == c]
                     W_c_val = W_c.get(c, 0)
-                    if not indices or W_c_val == 0:
+                    if not indices:
                         Var_e[c] = 0.0
                         Var_a[c] = 0.0
                         continue
-                    diff_e = embeddings_e[indices] - comp['mu_e'][None, :]
-                    Var_e[c] = float(np.sum(path_probs[indices] * np.sum(diff_e ** 2, axis=1)) / W_c_val)
-                    diff_a = attributions_a[indices] - comp['mu_a'][None, :]
-                    Var_a[c] = float(np.sum(path_probs[indices] * np.sum(diff_a ** 2, axis=1)) / W_c_val)
+                        
+                    Var_e[c] = compute_component_variance(
+                        embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val,
+                        "l2", use_weighted_distortion
+                    )
+                    Var_a[c] = compute_component_variance(
+                        attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val,
+                        metric_a, use_weighted_distortion
+                    )
 
             components, assignments, next_component_id = apply_adaptive_control(
                 embeddings_e, attributions_a, path_probs,
                 assignments, components, P_bar, Var_e, Var_a,
-                beta_e, beta_a, K_max, next_component_id
+                beta_e, beta_a, K_max, next_component_id,
+                metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
             )
 
             if len(components) > 0:
                 rd_stats = compute_full_rd_statistics(
                     embeddings_e, attributions_a, assignments, path_probs,
-                    components, beta_e, beta_a
+                    components, beta_e, beta_a,
+                    metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
                 )
                 L_RD_curr = rd_stats['L_RD']
+
+            # Track history
+            history["iterations"].append(iteration + 1)
+            history["n_components"].append(len(components))
+            history["L_RD"].append(float(L_RD_curr))
+            history["H"].append(float(rd_stats['H']))
+            history["D_e"].append(float(rd_stats['D_e']))
+            history["D_a"].append(float(rd_stats['D_a']))
 
             if check_convergence(L_RD_prev, L_RD_curr, convergence_threshold):
                 break
@@ -259,6 +256,8 @@ def _run_single_config(args_tuple):
             # Add detailed structure for retrospective analysis
             "assignments": [int(a) for a in assignments],
             "components": components_data,
+            # Add iteration history
+            "history": history
         }
 
     except Exception as e:
@@ -278,39 +277,41 @@ def run_sweep_mode(
     convergence_threshold: float,
     logger,
     n_workers: int = 4,
+    metric_a: str = "l2",
+    use_weighted_distortion: bool = True
 ) -> Dict:
     """Run sweep over (beta, gamma) grid with parallel processing.
 
     Args:
         data: Data dict with embeddings_e, attributions_a, path_probs
-        sweeps_config: Sweep configuration with beta_values, gamma_values, selection_method
+        sweeps_config: Sweep configuration with beta_values and gamma_values
         K_max: Maximum number of components
         max_iterations: Maximum EM iterations
         convergence_threshold: Convergence threshold
         logger: Logger instance
         n_workers: Number of parallel workers
+        metric_a: Attribution distance metric
+        use_weighted_distortion: Whether to use probability weights
 
     Returns:
-        Dict with grid results and best configuration
+        Dict with grid results
     """
     beta_values = sweeps_config.get("beta_values", [5.0])
     gamma_values = sweeps_config.get("gamma_values", [0.5])
-    selection_method = sweeps_config.get("selection_method", "harmonic")
-
     logger.info("=" * 60)
     logger.info("SWEEP MODE ENABLED")
     logger.info("=" * 60)
     logger.info(f"Beta values: {beta_values}")
     logger.info(f"Gamma values: {gamma_values}")
     logger.info(f"Total configurations: {len(beta_values) * len(gamma_values)}")
-    logger.info(f"Selection method: {selection_method}")
     logger.info(f"Workers: {n_workers}")
+    logger.info(f"Metric: {metric_a}, Weighted: {use_weighted_distortion}")
 
     # Build task list
     tasks = []
     for beta in beta_values:
         for gamma in gamma_values:
-            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold))
+            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion))
 
     # Run in parallel or sequential
     grid_results = []
@@ -346,29 +347,23 @@ def run_sweep_mode(
     grid_results.sort(key=lambda x: (x.get("beta", 0), x.get("gamma", 0)))
 
     # Build sweep results
+    H_0 = data.get("H_0")
     sweep_results = {
         "prefix_id": data["prefix_id"],
+        "prefix": data.get("prefix"),
+        "H_0": H_0.tolist() if hasattr(H_0, "tolist") else H_0,
         "sweep_config": {
             "beta_values": beta_values,
             "gamma_values": gamma_values,
-            "selection_method": selection_method,
+            "metric_a": metric_a,
+            "use_weighted_distortion": use_weighted_distortion
         },
         "grid": grid_results,
-    }
-
-    # Select best configuration
-    best = select_best_config(sweep_results, method=selection_method)
-    sweep_results["best"] = {
-        "beta": best.get("beta"),
-        "gamma": best.get("gamma"),
-        "selection_method": selection_method,
-        "metrics": {k: v for k, v in best.items() if k not in ["beta", "gamma", "error"]},
     }
 
     logger.info("\n" + "=" * 60)
     logger.info("SWEEP COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Best config: β={best.get('beta')}, γ={best.get('gamma')}")
-    logger.info(f"Best metrics: K={best.get('K')}, harmonic={best.get('harmonic', -1):.4f}")
+    logger.info(f"Completed {len(grid_results)} configurations")
 
     return sweep_results

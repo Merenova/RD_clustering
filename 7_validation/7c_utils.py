@@ -415,21 +415,18 @@ def get_encoder_weights(
 class SweepKey:
     """Type-safe sweep configuration key.
 
-    Handles both legacy 3-tuple format (method, hc_selection, top_B) and
-    new 4-tuple format (method, hc_selection, top_B, h_c_strategy).
+    Format: (method, hc_selection, top_B)
     """
     method: str
     hc_selection: str
     top_B: int
-    h_c_strategy: Optional[str] = None
 
     @classmethod
     def from_string(cls, key_str: str) -> 'SweepKey':
         """Parse sweep key from string format.
 
-        Formats:
-        - "multiplicative_full_B10" (legacy 3-tuple)
-        - "multiplicative_full_B10_Delta_H_c" (new 4-tuple)
+        Format:
+        - "multiplicative_full_B10"
 
         Args:
             key_str: Key string to parse
@@ -439,12 +436,8 @@ class SweepKey:
 
         Examples:
             >>> key = SweepKey.from_string("multiplicative_full_B10")
-            >>> key.method, key.top_B, key.h_c_strategy
-            ('multiplicative', 10, None)
-
-            >>> key = SweepKey.from_string("multiplicative_full_B10_Delta_H_c")
-            >>> key.h_c_strategy
-            'Delta_H_c'
+            >>> key.method, key.top_B
+            ('multiplicative', 10)
         """
         parts = key_str.split('_')
         if len(parts) < 3:
@@ -457,43 +450,26 @@ class SweepKey:
         b_part = parts[2]
         top_B = int(b_part[1:]) if b_part.startswith('B') else int(b_part)
 
-        # Check if h_c_strategy is present
-        h_c_strategy = None
-        if len(parts) >= 4:
-            # Handle strategy names with underscores like "H_c_centered"
-            h_c_strategy = '_'.join(parts[3:])
-
-        return cls(method, hc_sel, top_B, h_c_strategy)
+        return cls(method, hc_sel, top_B)
 
     @classmethod
     def from_tuple(cls, key_tuple: Tuple) -> 'SweepKey':
         """Create from tuple format.
 
         Args:
-            key_tuple: Either (method, hc_sel, top_B) or (method, hc_sel, top_B, strategy)
+            key_tuple: (method, hc_sel, top_B)
         """
-        if len(key_tuple) == 3:
-            return cls(key_tuple[0], key_tuple[1], key_tuple[2], None)
-        elif len(key_tuple) == 4:
-            return cls(key_tuple[0], key_tuple[1], key_tuple[2], key_tuple[3])
-        else:
-            raise ValueError(f"Invalid tuple length: {len(key_tuple)}")
+        if len(key_tuple) >= 3:
+            return cls(key_tuple[0], key_tuple[1], key_tuple[2])
+        raise ValueError(f"Invalid tuple length: {len(key_tuple)}")
 
     def to_tuple(self) -> Tuple:
         """Convert to tuple format for dict keys."""
-        if self.h_c_strategy is None:
-            return (self.method, self.hc_selection, self.top_B)
-        return (self.method, self.hc_selection, self.top_B, self.h_c_strategy)
+        return (self.method, self.hc_selection, self.top_B)
 
     def to_string(self) -> str:
         """Convert to string format."""
-        if self.h_c_strategy:
-            return f"{self.method}_{self.hc_selection}_B{self.top_B}_{self.h_c_strategy}"
         return f"{self.method}_{self.hc_selection}_B{self.top_B}"
-
-    def has_strategy(self) -> bool:
-        """Check if this key includes h_c_strategy."""
-        return self.h_c_strategy is not None
 
 
 def validate_and_normalize_sweep_config(
@@ -536,11 +512,10 @@ def validate_and_normalize_sweep_config(
 
     # Normalize other fields
     normalized.setdefault("top_B", defaults.get("top_B", [10]))
-    normalized.setdefault("h_c_strategy", defaults.get("h_c_strategy", "Delta_H_c"))
     normalized.setdefault("feature_selection", defaults.get("feature_selection", "magnitude"))
 
     # Convert scalars to lists
-    for key in ["h_c_selections", "top_B", "epsilon_values", "h_c_strategy", "feature_selection"]:
+    for key in ["h_c_selections", "top_B", "epsilon_values", "feature_selection"]:
         if key in normalized and not isinstance(normalized[key], list):
             normalized[key] = [normalized[key]]
 

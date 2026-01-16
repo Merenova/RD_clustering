@@ -9,6 +9,7 @@ Usage:
 """
 
 import sys
+import time
 import gc
 import json
 import argparse
@@ -87,7 +88,6 @@ def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, 
     """Parse sweep configuration from main config's stage_7c_steering section."""
     sweeps = stage_7c_config.get("sweeps", [])
 
-    global_h_c_strategy = stage_7c_config.get("h_c_strategy", "Delta_H_c")
     global_feature_selection = stage_7c_config.get("feature_selection", "magnitude")
     global_epsilon_values = stage_7c_config.get("epsilon_values", [-1.0, 0.0, 1.0])
 
@@ -97,7 +97,6 @@ def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, 
             "h_c_selections": ["full"],
             "top_B": [10],
             "epsilon_values": global_epsilon_values,
-            "h_c_strategy": global_h_c_strategy,
             "feature_selection": global_feature_selection
         }
         normalized_sweeps = [
@@ -125,7 +124,6 @@ def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, 
             "h_c_selections": [stage_7c_config.get("h_c_selection", "full")],
             "top_B": [stage_7c_config.get("top_B", 10)],
             "epsilon_values": global_epsilon_values,
-            "h_c_strategy": global_h_c_strategy,
             "feature_selection": global_feature_selection,
         }
 
@@ -134,7 +132,6 @@ def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, 
             "h_c_selections": ["full"],
             "top_B": [10],
             "epsilon_values": global_epsilon_values,
-            "h_c_strategy": global_h_c_strategy,
             "feature_selection": global_feature_selection
         }
         normalized_sweep = utils.validate_and_normalize_sweep_config(single_sweep, defaults)
@@ -154,6 +151,49 @@ def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, 
     return config
 
 
+def _save_hypothesis_outputs(prefix_results: Dict[str, Any], hypotheses: List[str], output_dir: Path, hypothesis_dirs: Dict[str, str]) -> None:
+    """Save per-hypothesis results into separate subfolders."""
+    prefix_id = prefix_results.get("prefix_id")
+    clustering_runs = prefix_results.get("clustering_runs", {})
+
+    for hypothesis in hypotheses:
+        folder_name = hypothesis_dirs.get(hypothesis, hypothesis)
+        hypothesis_dir = output_dir / folder_name
+        hypothesis_dir.mkdir(parents=True, exist_ok=True)
+
+        per_prefix = {
+            "prefix_id": prefix_id,
+            "feature_selection": prefix_results.get("feature_selection"),
+            "clustering_runs": {}
+        }
+
+        for clustering_key, run in clustering_runs.items():
+            entry = {
+                "beta": run.get("beta"),
+                "gamma": run.get("gamma"),
+                "n_clusters": run.get("n_clusters"),
+                "n_branches": run.get("n_branches"),
+            }
+            if "timing" in run:
+                entry["timing"] = run["timing"]
+
+            if hypothesis == "H4A":
+                entry["results"] = run.get("results", {})
+            elif hypothesis == "H4A_GEN":
+                if "H4a_generation" not in run:
+                    continue
+                entry["H4a_generation"] = run["H4a_generation"]
+            elif hypothesis == "H4C":
+                if "H4c_specificity" not in run:
+                    continue
+                entry["H4c_specificity"] = run["H4c_specificity"]
+
+            per_prefix["clustering_runs"][clustering_key] = entry
+
+        if per_prefix["clustering_runs"]:
+            save_json(per_prefix, hypothesis_dir / f"{prefix_id}_sweep_results.json")
+
+
 # =============================================================================
 # Common Steering Evaluation (Used by all hypotheses)
 # =============================================================================
@@ -171,6 +211,7 @@ def _run_steering_evaluation(
     first_token_only: bool = False,
     batch_size: int = 16,
     max_seq_len: int = None,
+    logger=None,
 ) -> Dict[int, Dict[str, float]]:
     """Common steering evaluation used by all hypotheses.
 
@@ -278,7 +319,8 @@ def _run_steering_evaluation(
                 # Get baseline with proper error handling and logging
                 if baseline_key not in meta:
                     if "log_P_original" not in meta:
-                        logger.warning(f"Missing baseline for branch {b['branch_id']}, using 0.0")
+                        if logger:
+                            logger.warning(f"Missing baseline for branch {b['branch_id']}, using 0.0")
                         baseline = 0.0
                     else:
                         baseline = meta["log_P_original"]
@@ -968,7 +1010,6 @@ def run_sweep_mode(
     config: Dict,
     steering_config: Dict,
     sweeps: List[Dict],
-    h_c_strategy: str,
     feature_selection: str,
     log_details: bool,
     device: torch.device,
@@ -992,27 +1033,31 @@ def run_sweep_mode(
         sweep_config = parse_sweeps_from_main_config(steering_config)
         sweeps = sweep_config.get("sweeps", [])
 
+    hypotheses = steering_config.get("hypotheses", [])
+    hypotheses = [h.upper() for h in hypotheses] if hypotheses else ["H4A"]
+    hypothesis_dirs = {
+        "H4A": "H4a",
+        "H4A_GEN": "H4a_gen",
+        "H4C": "H4c",
+    }
+
     # Log sweep info
     logger.info(f"Sweep configurations: {len(sweeps)}")
     for i, sw in enumerate(sweeps):
         logger.info(f"  [{i+1}] {sw.get('name', 'unnamed')}: {sw.get('steering_method')} | "
                     f"hc={sw.get('h_c_selections', sw.get('hc_selections'))} | B={sw.get('top_B')} | "
-                    f"eps={sw.get('epsilon_values', sw.get('epsilons'))} | strategy={sw.get('h_c_strategy')}")
+                    f"eps={sw.get('epsilon_values', sw.get('epsilons'))}")
     logger.info(f"Max samples/cluster: {max_cluster_samples}")
 
-    # Build aggregation keys
+    # Build aggregation keys (steering sweep keys)
     all_keys = []
     for sw in sweeps:
         method = sw.get("steering_method")
-        h_c_strategy_list = sw.get("h_c_strategy", [h_c_strategy])
-        if not isinstance(h_c_strategy_list, list):
-            h_c_strategy_list = [h_c_strategy_list]
         for hc_sel in sw.get("h_c_selections", sw.get("hc_selections", ["full"])):
             for tb in sw.get("top_B", [10]):
-                for strat in h_c_strategy_list:
-                    all_keys.append((method, hc_sel, tb, strat))
+                all_keys.append((method, hc_sel, tb))
 
-    aggregated = {key: {'r2': [], 'corr': [], 'win_r2': [], 'win_corr': [], 'logit_r2': [], 'logit_corr': []} for key in all_keys}
+    aggregated_by_clustering = {}
 
     # Find prefixes from attribution files
     attr_files = sorted(args.attribution_graphs_dir.glob("*_prefix_context.pt"))
@@ -1035,7 +1080,7 @@ def run_sweep_mode(
 
         # Load files
         branches_file = args.samples_dir / f"{prefix_id}_branches.json"
-        clustering_file = args.clustering_dir / f"{prefix_id}_clustering.json"
+        clustering_file = args.clustering_dir / f"{prefix_id}_sweep_results.json"
         attr_file = args.attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
 
         required_files = [branches_file, clustering_file, attr_file]
@@ -1044,44 +1089,49 @@ def run_sweep_mode(
             continue
 
         branches_data = load_json(branches_file)
-        clustering_data = load_json(clustering_file)
+        clustering_sweep = load_json(clustering_file)
         active_features, selected_features = graph.load_attribution_context(
             args.attribution_graphs_dir, prefix_id, use_continuation_attribution=True
         )
-
-        components = clustering_data.get("components", {})
         H_0 = None
-        H_0_raw = clustering_data.get("H_0")
+        H_0_raw = clustering_sweep.get("H_0")
         if H_0_raw is not None:
             H_0 = np.array(H_0_raw)
 
-        # Collect all unique h_c_strategies
-        all_h_c_strategies = set()
-        for sw in sweeps:
-            strat_list = sw.get("h_c_strategy", [h_c_strategy])
-            if not isinstance(strat_list, list):
-                strat_list = [strat_list]
-            all_h_c_strategies.update(strat_list)
+        grid_results = clustering_sweep.get("grid", [])
+        valid_grid = [
+            entry for entry in grid_results
+            if entry.get("components") and entry.get("assignments") and "error" not in entry
+        ]
+        if not valid_grid:
+            logger.warning(f"  No valid clustering results for {prefix_id}")
+            continue
 
         max_top_B = max(max(sw.get("top_B", [10])) for sw in sweeps)
         n_features = len(selected_features)
 
-        # Compute semantic graphs for all strategies
-        semantic_graphs_by_strategy = {}
-        for strat in all_h_c_strategies:
-            semantic_graphs = graph.compute_semantic_graphs_with_strategy(
-                components, strat, H_0, logger
-            )
-            if semantic_graphs:
-                semantic_graphs_by_strategy[strat] = semantic_graphs
+        prefix_results = {
+            "prefix_id": prefix_id,
+            "feature_selection": feature_selection,
+            "clustering_runs": {}
+        }
 
-        if not semantic_graphs_by_strategy:
-            logger.warning(f"  No valid semantic graphs for {prefix_id}")
-            continue
+        baseline_metadata = None
 
-        # Collect all feature indices needed
-        all_needed_indices = set()
-        for strat, semantic_graphs in semantic_graphs_by_strategy.items():
+        for grid_entry in valid_grid:
+            beta = grid_entry.get("beta")
+            gamma = grid_entry.get("gamma")
+            clustering_key = f"beta{beta}_gamma{gamma}"
+            components = grid_entry.get("components", {})
+            assignments = grid_entry.get("assignments", [])
+
+            semantic_graphs = graph.compute_semantic_graphs(components, H_0, logger)
+            if not semantic_graphs:
+                logger.warning(f"  No valid semantic graphs for {prefix_id} ({clustering_key})")
+                continue
+
+            # Collect all feature indices needed
+            all_needed_indices = set()
             for cluster_id, H_c in semantic_graphs.items():
                 H_c_features = H_c[:n_features]
                 abs_vals = np.abs(H_c_features)
@@ -1090,42 +1140,37 @@ def run_sweep_mode(
                     if abs(H_c_features[idx]) >= utils.EPSILON_SMALL:
                         all_needed_indices.add(int(idx))
 
-        logger.info(f"  Precomputing {len(all_needed_indices)} decoder vectors...")
+            logger.info(f"  Precomputing {len(all_needed_indices)} decoder vectors ({clustering_key})...")
+            t0_cache = time.perf_counter()
 
-        # Batch-fetch decoder vectors
-        global_decoder_cache = {}
-        if all_needed_indices:
-            layer_to_indices = {}
-            for h_c_idx in all_needed_indices:
-                feat_idx = selected_features[h_c_idx].item()
-                layer, pos, feat_id = active_features[feat_idx].tolist()
-                layer = int(layer)
-                if layer not in layer_to_indices:
-                    layer_to_indices[layer] = []
-                layer_to_indices[layer].append((h_c_idx, int(feat_id)))
+            # Batch-fetch decoder vectors
+            global_decoder_cache = {}
+            if all_needed_indices:
+                layer_to_indices = {}
+                for h_c_idx in all_needed_indices:
+                    feat_idx = selected_features[h_c_idx].item()
+                    layer, pos, feat_id = active_features[feat_idx].tolist()
+                    layer = int(layer)
+                    if layer not in layer_to_indices:
+                        layer_to_indices[layer] = []
+                    layer_to_indices[layer].append((h_c_idx, int(feat_id)))
 
-            for layer, idx_list in layer_to_indices.items():
-                h_c_indices = [x[0] for x in idx_list]
-                feat_ids = [x[1] for x in idx_list]
-                feat_ids_t = torch.tensor(feat_ids, device=device, dtype=torch.long)
-                dec_vecs = model.transcoders._get_decoder_vectors(layer, feat_ids_t)
-                for i, h_c_idx in enumerate(h_c_indices):
-                    global_decoder_cache[h_c_idx] = dec_vecs[i]
+                for layer, idx_list in layer_to_indices.items():
+                    h_c_indices = [x[0] for x in idx_list]
+                    feat_ids = [x[1] for x in idx_list]
+                    feat_ids_t = torch.tensor(feat_ids, device=device, dtype=torch.long)
+                    dec_vecs = model.transcoders._get_decoder_vectors(layer, feat_ids_t)
+                    for i, h_c_idx in enumerate(h_c_indices):
+                        global_decoder_cache[h_c_idx] = dec_vecs[i]
+            t1_cache = time.perf_counter()
 
-        # Build per-cluster caches
-        decoder_cache_by_strategy = {}
-        for strat, semantic_graphs in semantic_graphs_by_strategy.items():
             decoder_cache = graph.build_cluster_decoder_cache(
                 semantic_graphs, global_decoder_cache, active_features, selected_features,
                 max_features=max_top_B * 2
             )
-            decoder_cache_by_strategy[strat] = decoder_cache
 
-        # Build encoder caches
-        encoder_cache_by_strategy = {}
-        for strat, dec_cache in decoder_cache_by_strategy.items():
-            feats_by_c = {}
-            for c, cache_data in dec_cache.items():
+            features_by_cluster = {}
+            for c, cache_data in decoder_cache.items():
                 tuples = []
                 for i in range(len(cache_data['h_c_values'])):
                     tuples.append((
@@ -1134,152 +1179,172 @@ def run_sweep_mode(
                         cache_data['feat_ids'][i],
                         cache_data['h_c_values'][i]
                     ))
-                feats_by_c[c] = tuples
+                features_by_cluster[c] = tuples
 
-            encoder_cache_by_strategy[strat] = graph.precompute_cluster_encoder_weights(
-                model, feats_by_c, device
+            t0_encoder = time.perf_counter()
+            encoder_cache = graph.precompute_cluster_encoder_weights(
+                model, features_by_cluster, device
             )
+            t1_encoder = time.perf_counter()
 
-        # Build branches list (using shared utility)
-        assignments = clustering_data.get("assignments", [])
-        branches = utils.build_branches_from_data(branches_data, assignments)
+            # Build branches list (using shared utility)
+            branches = utils.build_branches_from_data(branches_data, assignments)
 
-        # Compute baseline
-        effective_batch_size = max_batch_size if max_batch_size > 0 else 32
-        logger.info(f"  Computing branch log_P values (batch_size={effective_batch_size})...")
-        branch_log_probs = steering.compute_branch_log_probs_batch(
-            model, branches, logger, batch_size=effective_batch_size, max_seq_len=max_seq_len
-        )
-        baseline_metadata = steering.compute_baseline_metadata(branches, branch_log_probs)
+            # Compute baseline
+            t0_baseline = time.perf_counter()
+            effective_batch_size = max_batch_size if max_batch_size > 0 else 32
+            if baseline_metadata is None:
+                logger.info(f"  Computing branch log_P values (batch_size={effective_batch_size})...")
+                baseline_branch_log_probs = steering.compute_branch_log_probs_batch(
+                    model, branches, logger, batch_size=effective_batch_size, max_seq_len=max_seq_len
+                )
+                baseline_metadata = steering.compute_baseline_metadata(branches, baseline_branch_log_probs)
+            t1_baseline = time.perf_counter()
 
-        first_strat = next(iter(semantic_graphs_by_strategy.keys()))
-        prefix_results = {
-            'prefix_id': prefix_id,
-            'n_clusters': len(semantic_graphs_by_strategy[first_strat]),
-            'n_branches': len(branches),
-            'results': {}
-        }
+            if clustering_key not in aggregated_by_clustering:
+                aggregated_by_clustering[clustering_key] = {
+                    key: {'r2': [], 'corr': [], 'win_r2': [], 'win_corr': [], 'logit_r2': [], 'logit_corr': []}
+                    for key in all_keys
+                }
 
-        # Run all sweep combinations
-        for sw in sweeps:
-            method = sw.get("steering_method")
-            hc_sels = sw.get("h_c_selections", sw.get("hc_selections", ["full"]))
-            top_B_list = sw.get("top_B", [10])
-            eps_list = sw.get("epsilon_values", sw.get("epsilons", [-1.0, 0.0, 1.0]))
-            h_c_strategy_list = sw.get("h_c_strategy", [h_c_strategy])
-            if not isinstance(h_c_strategy_list, list):
-                h_c_strategy_list = [h_c_strategy_list]
+            prefix_results["clustering_runs"][clustering_key] = {
+                "beta": beta,
+                "gamma": gamma,
+                "n_clusters": len(semantic_graphs),
+                "n_branches": len(branches),
+                "results": {},
+                "timing": {
+                    "decoder_cache_s": t1_cache - t0_cache,
+                    "encoder_cache_s": t1_encoder - t0_encoder,
+                    "baseline_s": t1_baseline - t0_baseline,
+                }
+            }
 
-            for hc_sel, top_B, strat in product(hc_sels, top_B_list, h_c_strategy_list):
-                if strat not in decoder_cache_by_strategy:
-                    logger.warning(f"  Skipping {strat} - no decoder cache available")
-                    continue
+            # Run all steering sweep combinations for this clustering config
+            t0_sweep = time.perf_counter()
+            for sw in sweeps:
+                method = sw.get("steering_method")
+                hc_sels = sw.get("h_c_selections", sw.get("hc_selections", ["full"]))
+                top_B_list = sw.get("top_B", [10])
+                eps_list = sw.get("epsilon_values", sw.get("epsilons", [-1.0, 0.0, 1.0]))
 
-                key = metrics.generate_sweep_key(method, hc_sel, top_B, strat)
-                logger.info(f"  Running {key}...")
+                for hc_sel, top_B in product(hc_sels, top_B_list):
+                    key = metrics.generate_sweep_key(method, hc_sel, top_B)
+                    logger.info(f"  Running {key} ({clustering_key})...")
 
-                result = run_steering_sweep(
-                    model=model,
-                    branches=branches,
-                    decoder_cache=decoder_cache_by_strategy[strat],
-                    encoder_cache=encoder_cache_by_strategy[strat],
-                    baseline_metadata=baseline_metadata,
-                    epsilons=eps_list,
-                    top_B=top_B,
-                    steering_method=method,
-                    hc_selection=hc_sel,
-                    max_samples_per_cluster=max_cluster_samples,
-                    log_details=log_details,
-                    max_batch_size=max_batch_size,
-                    cross_prefix_batching=cross_prefix_batching,
-                    max_seq_len=max_seq_len,
-                    logger=logger,
+                    result = run_steering_sweep(
+                        model=model,
+                        branches=branches,
+                        decoder_cache=decoder_cache,
+                        encoder_cache=encoder_cache,
+                        baseline_metadata=baseline_metadata,
+                        epsilons=eps_list,
+                        top_B=top_B,
+                        steering_method=method,
+                        hc_selection=hc_sel,
+                        max_samples_per_cluster=max_cluster_samples,
+                        log_details=log_details,
+                        max_batch_size=max_batch_size,
+                        cross_prefix_batching=cross_prefix_batching,
+                        max_seq_len=max_seq_len,
+                        logger=logger,
+                    )
+
+                    prefix_results["clustering_runs"][clustering_key]["results"][key] = result
+
+                    # Clear memory after each steering sweep result
+                    clear_memory()
+
+                    agg_key = (method, hc_sel, top_B)
+                    if agg_key in aggregated_by_clustering[clustering_key] and 'mean_r2' in result:
+                        aggregated_by_clustering[clustering_key][agg_key]['r2'].append(result['mean_r2'])
+                        aggregated_by_clustering[clustering_key][agg_key]['corr'].append(result.get('mean_corr', 0.0))
+                        aggregated_by_clustering[clustering_key][agg_key]['win_r2'].append(result.get('mean_win_r2', 0.0))
+                        aggregated_by_clustering[clustering_key][agg_key]['win_corr'].append(result.get('mean_win_corr', 0.0))
+                        aggregated_by_clustering[clustering_key][agg_key]['logit_r2'].append(result.get('mean_logit_r2', 0.0))
+                        aggregated_by_clustering[clustering_key][agg_key]['logit_corr'].append(result.get('mean_logit_corr', 0.0))
+            t1_sweep = time.perf_counter()
+            prefix_results["clustering_runs"][clustering_key]["timing"]["sweep_s"] = t1_sweep - t0_sweep
+
+            # H4a_gen (generation experiment)
+            if "H4A_GEN" in hypotheses:
+                num_samples_per_epsilon = steering_config.get("gen_num_samples_per_epsilon", 5)
+                gen_max_new_tokens = steering_config.get("gen_max_new_tokens", 50)
+                gen_temperature = steering_config.get("gen_temperature", 1.0)
+                gen_top_k = steering_config.get("gen_top_k", 50)
+                gen_top_p = steering_config.get("gen_top_p", 0.95)
+
+                first_sweep = sweeps[0] if sweeps else {}
+                gen_method = first_sweep.get("steering_method", "multiplicative")
+                gen_epsilons = first_sweep.get(
+                    "epsilon_values",
+                    first_sweep.get("epsilons", steering_config.get("epsilon_values", [-0.5, 0.0, 0.5]))
                 )
 
-                result['h_c_strategy'] = strat
-                prefix_results['results'][key] = result
+                logger.info(f"  Running H4a Generation experiment in sweep mode ({clustering_key})...")
+                h4a_gen_result = validate_h4a_generation(
+                    model=model,
+                    prefix_token_ids=branches_data.get("prefix_tokens_with_bos", []),
+                    prefix_text=branches_data.get("prefix", ""),
+                    features_by_cluster=features_by_cluster,
+                    cluster_decoder_cache=decoder_cache,
+                    cluster_encoder_cache=encoder_cache,
+                    epsilon_values=gen_epsilons,
+                    steering_method=gen_method,
+                    num_samples_per_epsilon=num_samples_per_epsilon,
+                    max_new_tokens=gen_max_new_tokens,
+                    temperature=gen_temperature,
+                    top_k=gen_top_k,
+                    top_p=gen_top_p,
+                    max_seq_len=max_seq_len,
+                    logger=logger
+                )
+                prefix_results["clustering_runs"][clustering_key]["H4a_generation"] = h4a_gen_result
 
-                # Clear memory after each steering sweep result
-                clear_memory()
+            # H4c (specificity)
+            if "H4C" in hypotheses and len(semantic_graphs) >= 2:
+                first_sweep = sweeps[0] if sweeps else {}
+                h4c_method = first_sweep.get("steering_method", "multiplicative")
+                h4c_top_B = first_sweep.get("top_B", [10])
+                if isinstance(h4c_top_B, list):
+                    h4c_top_B = h4c_top_B[0] if h4c_top_B else 10
+                h4c_epsilons = first_sweep.get(
+                    "epsilon_values",
+                    first_sweep.get("epsilons", steering_config.get("epsilon_values", [-0.5, 0.0, 0.5]))
+                )
+                h4c_epsilon = max([e for e in h4c_epsilons if e > 0], default=0.5)
 
-                agg_key = (method, hc_sel, top_B, strat)
-                if agg_key in aggregated and 'mean_r2' in result:
-                    aggregated[agg_key]['r2'].append(result['mean_r2'])
-                    aggregated[agg_key]['corr'].append(result.get('mean_corr', 0.0))
-                    aggregated[agg_key]['win_r2'].append(result.get('mean_win_r2', 0.0))
-                    aggregated[agg_key]['win_corr'].append(result.get('mean_win_corr', 0.0))
-                    aggregated[agg_key]['logit_r2'].append(result.get('mean_logit_r2', 0.0))
-                    aggregated[agg_key]['logit_corr'].append(result.get('mean_logit_corr', 0.0))
-
-        # Generation experiment (if enabled in config)
-        hypotheses = steering_config.get("hypotheses", [])
-        hypotheses = [h.upper() for h in hypotheses]
-
-        if "H4A_GEN" in hypotheses:
-            # Get generation config parameters
-            num_samples_per_epsilon = steering_config.get("gen_num_samples_per_epsilon", 5)
-            gen_max_new_tokens = steering_config.get("gen_max_new_tokens", 50)
-            gen_temperature = steering_config.get("gen_temperature", 1.0)
-            gen_top_k = steering_config.get("gen_top_k", 50)
-            gen_top_p = steering_config.get("gen_top_p", 0.95)
-
-            # Use first sweep's method and epsilon values for generation
-            first_sweep = sweeps[0] if sweeps else {}
-            gen_method = first_sweep.get("steering_method", "multiplicative")
-            gen_epsilons = first_sweep.get("epsilon_values", first_sweep.get("epsilons", steering_config.get("epsilon_values", [-0.5, 0.0, 0.5])))
-
-            # Build features_by_cluster for generation
-            first_strat = next(iter(semantic_graphs_by_strategy.keys()))
-            features_by_cluster = {}
-            for c in semantic_graphs_by_strategy[first_strat].keys():
-                if c in decoder_cache_by_strategy[first_strat]:
-                    cache_data = decoder_cache_by_strategy[first_strat][c]
-                    features = []
-                    for i in range(len(cache_data['h_c_values'])):
-                        features.append((
-                            cache_data['layers'][i],
-                            cache_data['positions'][i],
-                            cache_data['feat_ids'][i],
-                            cache_data['h_c_values'][i]
-                        ))
-                    features_by_cluster[c] = features
-
-            logger.info(f"  Running H4a Generation experiment in sweep mode...")
-            h4a_gen_result = validate_h4a_generation(
-                model=model,
-                prefix_token_ids=branches_data.get("prefix_tokens_with_bos", []),
-                prefix_text=branches_data.get("prefix", ""),
-                features_by_cluster=features_by_cluster,
-                cluster_decoder_cache=decoder_cache_by_strategy[first_strat],
-                cluster_encoder_cache=encoder_cache_by_strategy[first_strat],
-                epsilon_values=gen_epsilons,
-                steering_method=gen_method,
-                num_samples_per_epsilon=num_samples_per_epsilon,
-                max_new_tokens=gen_max_new_tokens,
-                temperature=gen_temperature,
-                top_k=gen_top_k,
-                top_p=gen_top_p,
-                max_seq_len=max_seq_len,
-                logger=logger
-            )
-            prefix_results["H4a_generation"] = h4a_gen_result
+                logger.info(f"  Running H4c specificity ({clustering_key})...")
+                h4c_result = validate_h4c_specificity(
+                    model, branches, semantic_graphs, active_features, selected_features,
+                    features_by_cluster, decoder_cache, encoder_cache,
+                    baseline_metadata, h4c_epsilon, h4c_top_B, h4c_method,
+                    cross_prefix_batching=cross_prefix_batching,
+                    max_samples_per_cluster=max_cluster_samples,
+                    batch_size=global_batch_size, max_seq_len=max_seq_len, logger=logger
+                )
+                prefix_results["clustering_runs"][clustering_key]["H4c_specificity"] = h4c_result
 
         all_results[prefix_id] = prefix_results
-        save_json(prefix_results, args.output_dir / f"{prefix_id}_sweep_results.json")
+        _save_hypothesis_outputs(prefix_results, hypotheses, args.output_dir, hypothesis_dirs)
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Print summary
-    logger.info("\n" + "=" * 100)
-    logger.info("SUMMARY: Metrics across prefixes")
-    logger.info("=" * 100)
-    logger.info(metrics.format_summary_table(aggregated))
+    if "H4A" in hypotheses:
+        h4a_dir = args.output_dir / hypothesis_dirs["H4A"]
+        h4a_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save aggregated summary
-    metrics.save_aggregated_summary(aggregated, prefix_ids, sweeps, args.output_dir / "aggregated_summary.json")
-    logger.info(f"\nSaved summary to {args.output_dir / 'aggregated_summary.json'}")
+        for clustering_key, aggregated in aggregated_by_clustering.items():
+            logger.info("\n" + "=" * 100)
+            logger.info(f"SUMMARY ({clustering_key}): Metrics across prefixes")
+            logger.info("=" * 100)
+            logger.info(metrics.format_summary_table(aggregated))
+
+            summary_path = h4a_dir / f"aggregated_summary_{clustering_key}.json"
+            metrics.save_aggregated_summary(aggregated, prefix_ids, sweeps, summary_path)
+            logger.info(f"\nSaved summary to {summary_path}")
 
 
 # =============================================================================
@@ -1301,9 +1366,6 @@ def main():
     parser.add_argument("--hypotheses", type=str, nargs="+", default=None,
                         help="List of hypotheses to run: H4a, H4a_gen, H4c")
     parser.add_argument("--feature-selection", type=str, choices=["magnitude", "distinct"], default=None)
-    parser.add_argument("--use-full-semantic-graph", action="store_true",
-                        help="Use full semantic graph (H_0 + Delta_H_c)")
-    parser.add_argument("--sweep-mode", action="store_true", help="Enable sweep mode")
     parser.add_argument("--log-details", action="store_true", help="Log detailed per-sample info")
     parser.add_argument("--quiet", action="store_true", help="Quiet mode")
     parser.add_argument("--cross-prefix-batching", action="store_true",
@@ -1337,12 +1399,8 @@ def main():
     max_cluster_samples = args.max_cluster_samples if args.max_cluster_samples is not None else steering_config.get("max_cluster_samples", 100)
     max_samples_per_token = steering_config.get("max_samples_per_token", 20)  # For H4B π-effect testing
     max_samples = args.max_samples if args.max_samples is not None else steering_config.get("max_samples")
-    use_full_semantic_graph = args.use_full_semantic_graph or steering_config.get("use_full_semantic_graph", False)
     cross_prefix_batching = args.cross_prefix_batching or steering_config.get("cross_prefix_batching", False)
-
-    h_c_strategy = steering_config.get("h_c_strategy", "Delta_H_c")
-    if use_full_semantic_graph and h_c_strategy == "Delta_H_c":
-        h_c_strategy = "H_c"
+    h_c_strategy = "H_c"
 
     if args.hypotheses is not None:
         hypotheses = [h.upper() for h in args.hypotheses]
@@ -1371,173 +1429,25 @@ def main():
         lazy_encoder=True, lazy_decoder=False
     )
 
-    # Check for sweep mode
     sweeps = steering_config.get("sweeps", [])
-    sweep_mode = args.sweep_mode or len(sweeps) > 0
     log_details = args.log_details or steering_config.get("log_details", False)
-
-    if sweep_mode:
-        logger.info("=" * 60)
-        logger.info("SWEEP MODE ENABLED")
-        logger.info("=" * 60)
-        run_sweep_mode(
-            model=model,
-            args=args,
-            config=config,
-            steering_config=steering_config,
-            sweeps=sweeps,
-            h_c_strategy=h_c_strategy,
-            feature_selection=feature_selection,
-            log_details=log_details,
-            device=device,
-            logger=logger,
-            cross_prefix_batching=cross_prefix_batching,
-        )
-        logger.info("SWEEP MODE COMPLETE")
-        return
-
-    # Process prefixes (single mode - hypothesis testing)
-    attr_files = sorted(args.attribution_graphs_dir.glob("*_prefix_context.pt"))
-    prefix_ids = [f.stem.replace("_prefix_context", "") for f in attr_files]
-    logger.info(f"Discovered {len(prefix_ids)} prefixes from attribution files")
-
-    if args.prefix_id:
-        prefix_ids = [args.prefix_id]
-
-    if max_samples is not None and max_samples > 0 and len(prefix_ids) > max_samples:
-        prefix_ids = prefix_ids[:max_samples]
-        logger.info(f"Cut to first {max_samples} prefixes")
-
-    all_results = {}
-
-    show_pbar = logger.getEffectiveLevel() >= logging.WARNING
-    iterator = tqdm(prefix_ids, desc="Processing Prefixes") if show_pbar else prefix_ids
-
-    for prefix_id in iterator:
-        logger.info(f"Processing {prefix_id}...")
-
-        # Load Files
-        branches_file = args.samples_dir / f"{prefix_id}_branches.json"
-        clustering_file = args.clustering_dir / f"{prefix_id}_clustering.json"
-        attr_file = args.attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
-
-        required_files = [branches_file, clustering_file, attr_file]
-        if not all(f.exists() for f in required_files):
-            logger.warning(f"Missing files for {prefix_id}")
-            continue
-
-        branches_data = load_json(branches_file)
-        clustering_data = load_json(clustering_file)
-        active_features, selected_features = graph.load_attribution_context(
-            args.attribution_graphs_dir, prefix_id, use_continuation_attribution=True
-        )
-
-        components = clustering_data.get("components", {})
-        H_0 = None
-        H_0_raw = clustering_data.get("H_0")
-        if H_0_raw is not None:
-            H_0 = np.array(H_0_raw)
-
-        semantic_graphs = graph.compute_semantic_graphs_with_strategy(
-            components, h_c_strategy, H_0, logger
-        )
-
-        # Pre-compute features and caches
-        features_by_cluster = {}
-        for c in semantic_graphs:
-            features_by_cluster[c] = graph.select_top_features_from_Hc(
-                semantic_graphs[c], active_features, selected_features, top_B,
-                selection_mode=feature_selection,
-                cluster_id=c,
-                all_semantic_graphs=semantic_graphs
-            )
-
-        logger.info(f"  Pre-computing decoder vectors for {len(features_by_cluster)} clusters...")
-        cluster_decoder_cache = graph.precompute_cluster_decoder_vectors(
-            model, features_by_cluster, device
-        )
-
-        logger.info(f"  Pre-computing encoder weights...")
-        cluster_encoder_cache = graph.precompute_cluster_encoder_weights(
-            model, features_by_cluster, device
-        )
-
-        # Build branches list (using shared utility)
-        assignments = clustering_data.get("assignments", [])
-        branches = utils.build_branches_from_data(branches_data, assignments)
-
-        # Compute baseline metadata
-        batch_size = steering_config.get("max_batch_size", 32)
-        effective_batch_size = batch_size if batch_size > 0 else global_batch_size
-        logger.info(f"  Computing baseline metadata for {len(branches)} branches (batch_size={effective_batch_size})...")
-        branch_log_probs = steering.compute_branch_log_probs_batch(
-            model, branches, logger, batch_size=effective_batch_size, max_seq_len=max_seq_len
-        )
-        baseline_metadata = steering.compute_baseline_metadata(branches, branch_log_probs)
-        logger.info(f"  Baseline metadata computed for {len(baseline_metadata)} branches")
-
-        prefix_results = {"per_component": {}, "hypotheses_run": hypotheses, "feature_selection": feature_selection}
-
-        # H4a: Dose-response (teacher-forcing evaluation)
-        if "H4A" in hypotheses:
-            h4a_result = validate_h4a_dose_response(
-                model, branches, features_by_cluster, cluster_decoder_cache, cluster_encoder_cache,
-                baseline_metadata, epsilon_values, steering_method,
-                cross_prefix_batching=cross_prefix_batching,
-                max_cluster_samples=max_cluster_samples,
-                batch_size=global_batch_size, max_seq_len=max_seq_len, logger=logger
-            )
-            prefix_results["per_component"] = h4a_result.get("per_component", {})
-
-        # H4a_gen: Generation experiment (steered sampling)
-        if "H4A_GEN" in hypotheses:
-            # Get generation config parameters
-            num_samples_per_epsilon = steering_config.get("gen_num_samples_per_epsilon", 5)
-            gen_max_new_tokens = steering_config.get("gen_max_new_tokens", 50)
-            gen_temperature = steering_config.get("gen_temperature", 1.0)
-            gen_top_k = steering_config.get("gen_top_k", 50)
-            gen_top_p = steering_config.get("gen_top_p", 0.95)
-
-            h4a_gen_result = validate_h4a_generation(
-                model=model,
-                prefix_token_ids=branches_data.get("prefix_tokens_with_bos", []),
-                prefix_text=branches_data.get("prefix", ""),
-                features_by_cluster=features_by_cluster,
-                cluster_decoder_cache=cluster_decoder_cache,
-                cluster_encoder_cache=cluster_encoder_cache,
-                epsilon_values=epsilon_values,
-                steering_method=steering_method,
-                num_samples_per_epsilon=num_samples_per_epsilon,
-                max_new_tokens=gen_max_new_tokens,
-                temperature=gen_temperature,
-                top_k=gen_top_k,
-                top_p=gen_top_p,
-                max_seq_len=max_seq_len,
-                logger=logger
-            )
-            prefix_results["H4a_generation"] = h4a_gen_result
-
-        # H4b removed
-
-        # H4c: Steering specificity
-        if "H4C" in hypotheses and len(semantic_graphs) >= 2:
-            h4c_epsilon = max([e for e in epsilon_values if e > 0], default=0.5)
-            h4c_result = validate_h4c_specificity(
-                model, branches, semantic_graphs, active_features, selected_features,
-                features_by_cluster, cluster_decoder_cache, cluster_encoder_cache,
-                baseline_metadata, h4c_epsilon, top_B, steering_method,
-                cross_prefix_batching=cross_prefix_batching,
-                max_samples_per_cluster=max_cluster_samples,
-                batch_size=global_batch_size, max_seq_len=max_seq_len, logger=logger
-            )
-            prefix_results["H4c_specificity"] = h4c_result
-
-        all_results[prefix_id] = prefix_results
-        save_json(prefix_results, args.output_dir / f"{prefix_id}_steering_results.json")
-
-        clear_memory()
-
-    logger.info("Validation Complete")
+    logger.info("=" * 60)
+    logger.info("SWEEP MODE ENABLED")
+    logger.info("=" * 60)
+    run_sweep_mode(
+        model=model,
+        args=args,
+        config=config,
+        steering_config=steering_config,
+        sweeps=sweeps,
+        feature_selection=feature_selection,
+        log_details=log_details,
+        device=device,
+        logger=logger,
+        cross_prefix_batching=cross_prefix_batching,
+    )
+    logger.info("SWEEP MODE COMPLETE")
+    return
 
 
 if __name__ == "__main__":

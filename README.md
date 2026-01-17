@@ -51,39 +51,6 @@ The number of motifs K is not pre-specified. Adaptive split/merge operations der
 - **Split**: When distortion reduction > entropy cost
 - **Merge**: When entropy savings > distortion increase
 
-## Installation
-```bash
-git clone https://github.com/[username]/mechanistic-motif-discovery.git
-cd mechanistic-motif-discovery
-pip install -r requirements.txt
-```
-
-## Quick Start
-```python
-from motif_discovery import MotifDiscovery
-
-# Initialize
-md = MotifDiscovery(
-    model="Qwen3-8B",
-    embedding_model="gemma-embedding",
-    transcoder="gemma-scope"
-)
-
-# Sample continuations
-continuations = md.sample(prefix="The capital of France is", n=100)
-
-# Discover motifs
-motifs = md.cluster(continuations, beta=5.0, gamma=0.5)
-
-# Inspect results
-for motif in motifs:
-    print(f"Motif {motif.id}: {motif.prior:.2%} of continuations")
-    print(f"  Top features: {motif.top_features[:5]}")
-    print(f"  Example: {motif.examples[0]}")
-
-# Validate via steering
-steering_results = md.validate_steering(motifs)
-```
 
 ## Applications
 

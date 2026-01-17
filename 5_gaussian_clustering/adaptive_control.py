@@ -27,6 +27,27 @@ from rd_objective import (
 )
 
 
+def weighted_median_1d(values: np.ndarray, weights: np.ndarray) -> float:
+    """Compute weighted median for 1D array."""
+    sorted_idx = np.argsort(values)
+    sorted_values = values[sorted_idx]
+    sorted_weights = weights[sorted_idx]
+    cumsum = np.cumsum(sorted_weights)
+    total = weights.sum()
+    median_idx = np.searchsorted(cumsum, total / 2)
+    median_idx = min(median_idx, len(values) - 1)
+    return float(sorted_values[median_idx])
+
+
+def weighted_median(data: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Compute coordinate-wise weighted median."""
+    n_features = data.shape[1]
+    result = np.zeros(n_features)
+    for j in range(n_features):
+        result[j] = weighted_median_1d(data[:, j], weights)
+    return result
+
+
 def pca_split_initialization(
     e_c: np.ndarray,
     a_c: np.ndarray,
@@ -70,7 +91,7 @@ def pca_split_initialization(
     sqrt_beta_e = np.sqrt(beta_e)
     sqrt_beta_a = np.sqrt(beta_a)
 
-    # Compute weighted centroids separately (avoid concatenation)
+    # Compute probability-weighted centroids
     mu_e = np.sum(P_norm[:, None] * e_c, axis=0)  # (d_e,)
     mu_a = np.sum(P_norm[:, None] * a_c, axis=0)  # (d_a,)
 
@@ -97,7 +118,7 @@ def pca_split_initialization(
         projections = (beta_e * (e_centered @ v_e) +
                        beta_a * (a_centered @ v_a))  # (n_c,)
 
-        # Compute Σv = Σ_n P_n x_n (x_n^T v)
+        # Compute Σv = Σ_n P_n x_n (x_n^T v) (probability-weighted PCA)
         # For e part: sqrt(β_e) * Σ P_n e_centered * proj
         # For a part: sqrt(β_a) * Σ P_n a_centered * proj
         weighted_proj = P_norm * projections  # (n_c,)
@@ -126,7 +147,8 @@ def pca_split_initialization(
     # Split by weighted median
     sorted_indices = np.argsort(projections)
     cumsum = np.cumsum(P_c[sorted_indices])
-    median_idx = np.searchsorted(cumsum, W_c / 2)
+    total_weight = np.sum(P_c)  # W_c = total probability mass
+    median_idx = np.searchsorted(cumsum, total_weight / 2)
     median_idx = min(median_idx, n_c - 1)
     threshold = projections[sorted_indices[median_idx]]
 
@@ -158,7 +180,6 @@ def split_operation(
     next_component_id: int,
     W_total: float,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Split operation using exact rate-distortion criterion (optimized).
 
@@ -183,7 +204,6 @@ def split_operation(
         next_component_id: Next available component ID
         W_total: Total probability mass
         metric_a: Attribution distance metric ("l2" or "l1")
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (updated_components, updated_assignments, next_component_id)
@@ -233,25 +253,21 @@ def split_operation(
         if not np.any(c1_mask) or not np.any(c2_mask):
             continue
 
-        # Compute initial centroids from PCA split
-        # If unweighted, we should use unweighted centroids? 
-        # But for split initialization, weighted is fine as a start.
+        # Compute initial centroids from PCA split (probability-weighted)
         W1 = np.sum(P_c[c1_mask])
         W2 = np.sum(P_c[c2_mask])
 
         if W1 == 0 or W2 == 0:
             continue
             
-        # Helper to compute centroid
+        # Helper to compute centroid (always probability-weighted)
         def get_centroid(data_chunk, weights_chunk, w_total, metric="l2"):
-             if use_weighted_distortion:
-                 center = np.sum(weights_chunk[:, None] * data_chunk, axis=0) / w_total
-             else:
-                 if metric == "l1":
-                     center = np.median(data_chunk, axis=0)
-                 else:
-                     center = np.mean(data_chunk, axis=0)
-             return center
+            if metric == "l1":
+                # Probability-weighted median
+                return weighted_median(data_chunk, weights_chunk)
+            else:
+                # Probability-weighted mean
+                return np.sum(weights_chunk[:, None] * data_chunk, axis=0) / w_total
 
         mu1_e = get_centroid(e_c[c1_mask], P_c[c1_mask], W1, "l2")
         mu1_a = get_centroid(a_c[c1_mask], P_c[c1_mask], W1, metric_a)
@@ -314,11 +330,11 @@ def split_operation(
         W2 = np.sum(P_c[c2_mask])
         alpha = W1 / (W1 + W2)
 
-        # Compute post-split variances using helper function
-        var1_e = compute_component_variance(e_c[c1_mask], mu1_e, P_c[c1_mask], W1, "l2", use_weighted_distortion)
-        var2_e = compute_component_variance(e_c[c2_mask], mu2_e, P_c[c2_mask], W2, "l2", use_weighted_distortion)
-        var1_a = compute_component_variance(a_c[c1_mask], mu1_a, P_c[c1_mask], W1, metric_a, use_weighted_distortion)
-        var2_a = compute_component_variance(a_c[c2_mask], mu2_a, P_c[c2_mask], W2, metric_a, use_weighted_distortion)
+        # Compute post-split variances using helper function (always probability-weighted)
+        var1_e = compute_component_variance(e_c[c1_mask], mu1_e, P_c[c1_mask], W1, "l2")
+        var2_e = compute_component_variance(e_c[c2_mask], mu2_e, P_c[c2_mask], W2, "l2")
+        var1_a = compute_component_variance(a_c[c1_mask], mu1_a, P_c[c1_mask], W1, metric_a)
+        var2_a = compute_component_variance(a_c[c2_mask], mu2_a, P_c[c2_mask], W2, metric_a)
 
         # Pre-split variances
         var_c_e = Var_e.get(c, 0)
@@ -378,7 +394,6 @@ def junk_operation(
     beta_a: float,
     W_total: float,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int]]:
     """Junk operation using exact rate-distortion criterion.
 
@@ -403,7 +418,6 @@ def junk_operation(
         beta_a: Attribution distortion weight
         W_total: Total probability mass
         metric_a: Attribution metric
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (updated_components, updated_assignments)
@@ -489,18 +503,10 @@ def junk_operation(
         dist_to_new_e = get_dist_pairwise(e_c, centers_e[best_idx], "l2")
         dist_to_new_a = get_dist_pairwise(a_c, centers_a[best_idx], metric_a)
 
-        # Weighted distortion change
-        if use_weighted_distortion:
-            weights = P_c / W_total
-            delta_D_e = float(np.sum(weights * (dist_to_new_e - dist_to_current_e)))
-            delta_D_a = float(np.sum(weights * (dist_to_new_a - dist_to_current_a)))
-        else:
-            # Unweighted distortion (weighted by count fraction N_c/N implicitly in formula)
-            # D = sum (N_c/N) * mean_dist_c
-            # Delta D = sum (1/N) * (dist_new - dist_old)
-            n_samples = len(embeddings_e)
-            delta_D_e = float(np.sum((1/n_samples) * (dist_to_new_e - dist_to_current_e)))
-            delta_D_a = float(np.sum((1/n_samples) * (dist_to_new_a - dist_to_current_a)))
+        # Probability-weighted distortion change
+        weights = P_c / W_total
+        delta_D_e = float(np.sum(weights * (dist_to_new_e - dist_to_current_e)))
+        delta_D_a = float(np.sum(weights * (dist_to_new_a - dist_to_current_a)))
 
         # Compute rate savings
         H_before = compute_entropy(P_bar)
@@ -545,22 +551,19 @@ def junk_operation(
                 W_c_prime = float(np.sum(P_c_prime))
 
                 if W_c_prime > 0:
-                    if use_weighted_distortion:
-                        mu_e_new = np.sum(P_c_prime[:, None] * embeddings_e[idx_c_prime], axis=0) / W_c_prime
-                    else:
-                        mu_e_new = np.mean(embeddings_e[idx_c_prime], axis=0)
+                    # Probability-weighted mean for semantic
+                    mu_e_new = np.sum(P_c_prime[:, None] * embeddings_e[idx_c_prime], axis=0) / W_c_prime
                         
                     mu_e_norm = np.linalg.norm(mu_e_new)
                     if mu_e_norm > 1e-10:
                         mu_e_new = mu_e_new / mu_e_norm
                         
                     if metric_a == "l1":
-                        mu_a_new = np.median(attributions_a[idx_c_prime], axis=0)
+                        # Probability-weighted median for L1
+                        mu_a_new = weighted_median(attributions_a[idx_c_prime], P_c_prime)
                     else:
-                        if use_weighted_distortion:
-                             mu_a_new = np.sum(P_c_prime[:, None] * attributions_a[idx_c_prime], axis=0) / W_c_prime
-                        else:
-                             mu_a_new = np.mean(attributions_a[idx_c_prime], axis=0)
+                        # Probability-weighted mean for L2
+                        mu_a_new = np.sum(P_c_prime[:, None] * attributions_a[idx_c_prime], axis=0) / W_c_prime
 
                     new_components[c_prime]['mu_e'] = mu_e_new
                     new_components[c_prime]['mu_a'] = mu_a_new
@@ -584,7 +587,6 @@ def apply_adaptive_control(
     K_max: int,
     next_component_id: int,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Apply all adaptive control operations in sequence.
 
@@ -605,7 +607,6 @@ def apply_adaptive_control(
         K_max: Maximum components
         next_component_id: Next available component ID
         metric_a: Metric for attribution
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (components, assignments, next_component_id)
@@ -619,7 +620,7 @@ def apply_adaptive_control(
         embeddings_e, attributions_a, path_probs, assignments,
         components, P_bar, Var_e, Var_a, beta_e, beta_a,
         K_max, next_component_id, W_total,
-        metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+        metric_a=metric_a,
     )
 
     # Recompute P_bar and variances after split
@@ -642,18 +643,18 @@ def apply_adaptive_control(
 
         Var_e[c] = compute_component_variance(
             embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val,
-            "l2", use_weighted_distortion
+            "l2",
         )
         Var_a[c] = compute_component_variance(
             attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val,
-            metric_a, use_weighted_distortion
+            metric_a,
         )
 
     # 2. Junk operation
     components, assignments = junk_operation(
         embeddings_e, attributions_a, path_probs, assignments,
         components, P_bar, beta_e, beta_a, W_total,
-        metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+        metric_a=metric_a,
     )
 
     return components, assignments, next_component_id
@@ -681,7 +682,7 @@ if __name__ == "__main__":
     path_probs = np.random.rand(n_samples)
     path_probs = path_probs / np.sum(path_probs)
 
-    # Start with single component
+    # Start with single component (probability-weighted initialization)
     assignments = [1] * n_samples
     W_total = np.sum(path_probs)
     mu_e_init = np.sum(path_probs[:, None] * embeddings_e, axis=0) / W_total
@@ -725,14 +726,14 @@ if __name__ == "__main__":
     print(f"\nAfter adaptive control:")
     print(f"  Components: {len(updated_components)}")
     
-    # Test L1 Unweighted
-    print("\nTesting L1 Unweighted adaptive control...")
+    # Test L1
+    print("\nTesting L1 adaptive control...")
     updated_components_l1, _, _ = apply_adaptive_control(
         embeddings_e, attributions_a, path_probs, assignments,
         components, P_bar, Var_e, Var_a,
         beta_e, beta_a, K_max, next_component_id=2,
-        metric_a="l1", use_weighted_distortion=False
+        metric_a="l1",
     )
-    print(f"  Components (L1 Unweighted): {len(updated_components_l1)}")
+    print(f"  Components (L1): {len(updated_components_l1)}")
 
     print("\nAdaptive control test passed!")

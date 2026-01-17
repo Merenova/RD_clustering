@@ -18,6 +18,43 @@ from rd_objective import (
     compute_l1_distances,
 )
 
+
+def weighted_median_1d(values: np.ndarray, weights: np.ndarray) -> float:
+    """Compute weighted median for 1D array.
+    
+    Args:
+        values: 1D array of values
+        weights: 1D array of weights (probabilities)
+    
+    Returns:
+        Weighted median value
+    """
+    sorted_idx = np.argsort(values)
+    sorted_values = values[sorted_idx]
+    sorted_weights = weights[sorted_idx]
+    cumsum = np.cumsum(sorted_weights)
+    total = weights.sum()
+    median_idx = np.searchsorted(cumsum, total / 2)
+    median_idx = min(median_idx, len(values) - 1)
+    return float(sorted_values[median_idx])
+
+
+def weighted_median(data: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Compute coordinate-wise weighted median.
+    
+    Args:
+        data: 2D array (n_samples, n_features)
+        weights: 1D array of weights (n_samples,)
+    
+    Returns:
+        1D array of weighted medians per coordinate
+    """
+    n_features = data.shape[1]
+    result = np.zeros(n_features)
+    for j in range(n_features):
+        result[j] = weighted_median_1d(data[:, j], weights)
+    return result
+
 # Try to import GPU utils
 try:
     from gpu_utils import get_compute_backend, TORCH_AVAILABLE
@@ -115,7 +152,6 @@ def m_step(
     path_probs: np.ndarray,
     component_ids: List[int],
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[Dict[int, Dict], Dict[int, float]]:
     """M-step: Update components with probability-weighted statistics (vectorized).
 
@@ -128,8 +164,7 @@ def m_step(
         attributions_a: Attribution embeddings
         path_probs: Path probabilities
         component_ids: List of component IDs to update
-        metric_a: Metric for attribution center calculation ("l2" -> mean, "l1" -> median)
-        use_weighted_distortion: Whether to use probability weights for centroid calculation
+        metric_a: Metric for attribution center calculation ("l2" -> mean, "l1" -> weighted median)
 
     Returns:
         Tuple of (updated_components, W_c masses)
@@ -160,13 +195,9 @@ def m_step(
 
         W_c[c] = W
 
-        # Update semantic center
+        # Update semantic center (probability-weighted mean)
         # Semantic is always L2 spherical -> Mean direction
-        if use_weighted_distortion:
-            mu_e_c = np.sum(P_c[:, None] * e_c, axis=0) / W
-        else:
-            # Unweighted mean
-            mu_e_c = np.mean(e_c, axis=0)
+        mu_e_c = np.sum(P_c[:, None] * e_c, axis=0) / W
             
         # L2-normalize for spherical clustering
         mu_e_norm = np.linalg.norm(mu_e_c)
@@ -175,27 +206,11 @@ def m_step(
 
         # Update attribution center
         if metric_a == "l1":
-            # Median (K-Medians) minimizes L1
-            # Note: Weighted median is complex, implementing unweighted median for simplicity
-            # or if use_weighted_distortion=True, we might want weighted median.
-            # But standard numpy doesn't have weighted median. 
-            # For this "design check", if l1 is requested, we likely want robust centroid.
-            # We'll use unweighted median if metric="l1", even if weighted=True, 
-            # unless we implement weighted median.
-            # However, since the user asked for "No Probability weight for distortion" as a separate point,
-            # they might want "Weighted L1".
-            # Implementing unweighted median for L1 is safe standard practice.
-            # Implementing weighted median requires sorting. 
-            # Given constraints, I will use unweighted median for L1 regardless of use_weighted_distortion flag 
-            # OR fallback to mean if that's what user intends (but Mean doesn't minimize L1).
-            # The prompt says "1. L1 loss for attribution". Minimizer of L1 is Median.
-            mu_a_c = np.median(a_c, axis=0)
+            # L1 -> Probability-weighted median (coordinate-wise)
+            mu_a_c = weighted_median(a_c, P_c)
         else:
-            # L2 -> Mean
-            if use_weighted_distortion:
-                mu_a_c = np.sum(P_c[:, None] * a_c, axis=0) / W
-            else:
-                mu_a_c = np.mean(a_c, axis=0)
+            # L2 -> Probability-weighted mean
+            mu_a_c = np.sum(P_c[:, None] * a_c, axis=0) / W
 
         # Store indices as list for compatibility
         indices = np.where(mask)[0].tolist()
@@ -219,7 +234,6 @@ def run_em_iteration(
     beta_a: float,
     use_gpu: bool = True,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[List[int], Dict[int, Dict], Dict]:
     """Run one EM iteration with rate-distortion assignment.
 
@@ -232,7 +246,6 @@ def run_em_iteration(
         beta_a: Attribution distortion weight
         use_gpu: Whether to use GPU acceleration if available
         metric_a: Metric for attribution distortion
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Tuple of (assignments, updated_components, rd_statistics)
@@ -274,7 +287,7 @@ def run_em_iteration(
         metric_a=metric_a
     )
 
-    # M-step: Update components
+    # M-step: Update components (always probability-weighted)
     active_ids = list(set(assignments) - {-1})
     updated_components, W_c = m_step(
         assignments,
@@ -283,10 +296,9 @@ def run_em_iteration(
         path_probs,
         active_ids,
         metric_a=metric_a,
-        use_weighted_distortion=use_weighted_distortion
     )
 
-    # Compute R-D statistics
+    # Compute R-D statistics (always probability-weighted)
     rd_stats = compute_full_rd_statistics(
         embeddings_e,
         attributions_a,
@@ -296,7 +308,6 @@ def run_em_iteration(
         beta_e,
         beta_a,
         metric_a=metric_a,
-        use_weighted_distortion=use_weighted_distortion
     )
 
     return assignments, updated_components, rd_stats
@@ -342,7 +353,7 @@ if __name__ == "__main__":
     path_probs = np.random.rand(n_samples)
     path_probs = path_probs / np.sum(path_probs)
 
-    # Initialize with random assignments
+    # Initialize with random assignments (probability-weighted)
     init_assignments = list(np.random.choice([1, 2, 3], size=n_samples))
     components = {}
     for c in [1, 2, 3]:
@@ -369,15 +380,14 @@ if __name__ == "__main__":
         beta_e=1.0,
         beta_a=1.0,
         metric_a="l2",
-        use_weighted_distortion=True
     )
 
-    print(f"\nAfter EM iteration (L2 Weighted):")
+    print(f"\nAfter EM iteration (L2):")
     print(f"  Components: {len(updated_components)}")
     print(f"  L_RD: {rd_stats['L_RD']:.4f}")
     print(f"  H(C): {rd_stats['H']:.4f}")
     
-    # Run EM iteration L1 Unweighted
+    # Run EM iteration L1
     assignments, updated_components, rd_stats = run_em_iteration(
         embeddings_e,
         attributions_a,
@@ -386,10 +396,9 @@ if __name__ == "__main__":
         beta_e=1.0,
         beta_a=1.0,
         metric_a="l1",
-        use_weighted_distortion=False
     )
     
-    print(f"\nAfter EM iteration (L1 Unweighted):")
+    print(f"\nAfter EM iteration (L1):")
     print(f"  Components: {len(updated_components)}")
     print(f"  L_RD: {rd_stats['L_RD']:.4f}")
 

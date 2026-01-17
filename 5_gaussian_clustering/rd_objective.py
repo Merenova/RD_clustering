@@ -83,7 +83,6 @@ def compute_semantic_distortion(
     components: Dict[int, Dict],
     P_bar: Dict[int, float],
     W_c: Dict[int, float],
-    use_weighted_distortion: bool = True
 ) -> Tuple[float, Dict[int, float]]:
     """Compute semantic distortion D^(e) = Σ P̄_c Var_c^(e,w) (vectorized).
 
@@ -94,7 +93,6 @@ def compute_semantic_distortion(
         components: Component dict with mu_e centers
         P_bar: Normalized component masses
         W_c: Component masses
-        use_weighted_distortion: Whether to use path_probs for distortion weighting
 
     Returns:
         Tuple of (total distortion D^(e), per-component Var_c^(e,w))
@@ -124,21 +122,12 @@ def compute_semantic_distortion(
         diff = e_c - mu_e[None, :]
         sq_dists = np.sum(diff ** 2, axis=1)
         
-        if use_weighted_distortion:
-            P_c = path_probs[mask]
-            if W_c.get(c, 0) == 0:
-                Var_e[c] = 0.0
-            else:
-                Var_e[c] = float(np.sum(P_c * sq_dists) / W_c[c])
-            D_e += P_bar[c] * Var_e[c]
+        P_c = path_probs[mask]
+        if W_c.get(c, 0) == 0:
+            Var_e[c] = 0.0
         else:
-             # Unweighted mean variance
-            Var_e[c] = float(np.mean(sq_dists))
-            # Contribution weighted by count fraction? 
-            # If "No probability weight for distortion", we usually mean D = sum_i dist(x_i, c_i) / N.
-            # Which is sum_c (N_c/N) * mean_dist_c.
-            count_fraction = len(e_c) / n_samples
-            D_e += count_fraction * Var_e[c]
+            Var_e[c] = float(np.sum(P_c * sq_dists) / W_c[c])
+        D_e += P_bar[c] * Var_e[c]
 
     return D_e, Var_e
 
@@ -151,7 +140,6 @@ def compute_attribution_distortion(
     P_bar: Dict[int, float],
     W_c: Dict[int, float],
     metric: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Tuple[float, Dict[int, float]]:
     """Compute attribution distortion D^(a) = Σ P̄_c Var_c^(a,w) (vectorized).
 
@@ -163,7 +151,6 @@ def compute_attribution_distortion(
         P_bar: Normalized component masses
         W_c: Component masses
         metric: "l2" or "l1"
-        use_weighted_distortion: Whether to use path_probs for distortion weighting
 
     Returns:
         Tuple of (total distortion D^(a), per-component Var_c^(a,w))
@@ -197,17 +184,13 @@ def compute_attribution_distortion(
         else:
              raise ValueError(f"Unknown metric {metric}")
 
-        if use_weighted_distortion:
-            P_c = path_probs[mask]
-            if W_c.get(c, 0) == 0:
-                Var_a[c] = 0.0
-            else:
-                Var_a[c] = float(np.sum(P_c * dists) / W_c[c])
-            D_a += P_bar[c] * Var_a[c]
+        # Probability-weighted distortion
+        P_c = path_probs[mask]
+        if W_c.get(c, 0) == 0:
+            Var_a[c] = 0.0
         else:
-            Var_a[c] = float(np.mean(dists))
-            count_fraction = len(a_c) / n_samples
-            D_a += count_fraction * Var_a[c]
+            Var_a[c] = float(np.sum(P_c * dists) / W_c[c])
+        D_a += P_bar[c] * Var_a[c]
 
     return D_a, Var_a
 
@@ -245,7 +228,6 @@ def compute_full_rd_statistics(
     beta_e: float,
     beta_a: float,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> Dict:
     """Compute all rate-distortion statistics.
 
@@ -257,6 +239,7 @@ def compute_full_rd_statistics(
         components: Component dictionary
         beta_e: Semantic distortion weight
         beta_a: Attribution distortion weight
+        metric_a: Attribution metric ("l2" or "l1")
 
     Returns:
         Dictionary with all R-D statistics
@@ -270,14 +253,13 @@ def compute_full_rd_statistics(
     # Compute rate (entropy)
     H = compute_entropy(P_bar)
 
-    # Compute distortions
+    # Compute distortions (always probability-weighted)
     D_e, Var_e = compute_semantic_distortion(
         embeddings_e, assignments, path_probs, components, P_bar, W_c,
-        use_weighted_distortion=use_weighted_distortion
     )
     D_a, Var_a = compute_attribution_distortion(
         attributions_a, assignments, path_probs, components, P_bar, W_c,
-        metric=metric_a, use_weighted_distortion=use_weighted_distortion
+        metric=metric_a,
     )
 
     # Compute full objective
@@ -296,7 +278,6 @@ def compute_full_rd_statistics(
         'beta_e': beta_e,
         'beta_a': beta_a,
         'metric_a': metric_a,
-        'weighted_distortion': use_weighted_distortion
     }
 
 
@@ -409,7 +390,6 @@ def compute_component_variance(
     weights: np.ndarray,
     total_weight: float,
     metric: str = "l2",
-    use_weighted_distortion: bool = True
 ) -> float:
     """Compute probability-weighted variance for a component.
 
@@ -419,10 +399,9 @@ def compute_component_variance(
         weights: Probability weights (n_c,)
         total_weight: Sum of weights (W_c)
         metric: "l2" or "l1"
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
-        Weighted variance
+        Probability-weighted variance
     """
     if len(data) == 0:
         return 0.0
@@ -434,12 +413,9 @@ def compute_component_variance(
     else:
         raise ValueError(f"Unknown metric {metric}")
         
-    if use_weighted_distortion:
-        if total_weight == 0:
-            return 0.0
-        return float(np.sum(weights * dists) / total_weight)
-    else:
-        return float(np.mean(dists))
+    if total_weight == 0:
+        return 0.0
+    return float(np.sum(weights * dists) / total_weight)
 
 
 # Aliases for backward compatibility
@@ -478,7 +454,7 @@ if __name__ == "__main__":
     path_probs = np.random.rand(n_samples)
     path_probs = path_probs / np.sum(path_probs)
 
-    # Create dummy components
+    # Create dummy components (probability-weighted initialization)
     assignments = list(np.random.choice([1, 2, 3], size=n_samples))
     components = {}
     for c in [1, 2, 3]:
@@ -504,12 +480,12 @@ if __name__ == "__main__":
     print(f"  D^(a): {stats['D_a']:.4f}")
     print(f"  W_total: {stats['W_total']:.4f}")
     
-    # Compute R-D statistics (L1 Unweighted)
+    # Compute R-D statistics (L1)
     stats_l1 = compute_full_rd_statistics(
         embeddings_e, attributions_a, assignments, path_probs,
-        components, beta_e=1.0, beta_a=1.0, metric_a="l1", use_weighted_distortion=False
+        components, beta_e=1.0, beta_a=1.0, metric_a="l1"
     )
-    print("\nRate-Distortion Statistics (L1 Unweighted):")
+    print("\nRate-Distortion Statistics (L1):")
     print(f"  L_RD: {stats_l1['L_RD']:.4f}")
     print(f"  H(C): {stats_l1['H']:.4f}")
     print(f"  D^(e): {stats_l1['D_e']:.4f}")

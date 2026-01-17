@@ -817,6 +817,8 @@ def compute_branch_log_probs_batch(
     logger,
     batch_size: int = 32,
     max_seq_len: int = None,
+    desc: str | None = None,
+    progress=None,
 ) -> Dict[int, Dict[str, Any]]:
     """Compute baseline log-probabilities for all branches in a batch.
 
@@ -834,8 +836,24 @@ def compute_branch_log_probs_batch(
         {branch_id: {"log_P_original": ..., "per_token_log_probs_original": ...}}
     """
     results = {}
+    total_branches = len(branches)
+    total_batches = max(1, (total_branches + batch_size - 1) // batch_size) if total_branches else 0
+    if logger:
+        logger.info(f"  Baseline log_P batching: {total_branches} branches -> {total_batches} batches (batch_size={batch_size})")
 
-    for i in tqdm(range(0, len(branches), batch_size), desc="Computing branch log_P", leave=False):
+    if progress is None:
+        progress_desc = desc or "Computing branch log_P"
+        iterator = tqdm(
+            range(0, total_branches, batch_size),
+            total=total_batches,
+            desc=progress_desc,
+            leave=False,
+            dynamic_ncols=True,
+        )
+    else:
+        iterator = range(0, total_branches, batch_size)
+
+    for i in iterator:
         batch = branches[i:i+batch_size]
         batch_tokens = [b.get("full_token_ids", []) for b in batch]
         
@@ -897,6 +915,9 @@ def compute_branch_log_probs_batch(
                 "per_token_centered_logits_original": per_token_centered_logits,
                 "mean_centered_logit_original": mean_centered_logit,
             }
+
+        if progress is not None:
+            progress.update(1)
         
         # Clear memory after each batch
         del logits

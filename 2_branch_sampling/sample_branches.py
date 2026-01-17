@@ -95,6 +95,105 @@ def build_prefix_tokens_with_bos(prefix: str, tokenizer) -> List[int]:
     return [bos_id] + token_ids_list
 
 
+def extract_logprob_for_token(logprob_entry: Any, token_id: int) -> Optional[float]:
+    """Extract logprob for a specific token_id from a prompt_logprobs entry."""
+    if logprob_entry is None:
+        return None
+    if isinstance(logprob_entry, dict):
+        val = logprob_entry.get(token_id)
+        if val is None:
+            return None
+        if hasattr(val, "logprob"):
+            return float(val.logprob)
+        if isinstance(val, dict):
+            lp = val.get("logprob", val.get("log_prob"))
+            return float(lp) if lp is not None else None
+        if isinstance(val, (int, float)):
+            return float(val)
+        return None
+    if hasattr(logprob_entry, "logprob"):
+        return float(logprob_entry.logprob)
+    return None
+
+
+def compute_temp1_logprobs(
+    llm: LLM,
+    tokenizer: AutoTokenizer,
+    prefix: str,
+    continuations: List[Continuation],
+    logger,
+    batch_size: int,
+) -> None:
+    """Rescore continuations with temperature=1.0 using prompt logprobs."""
+    if not continuations:
+        return
+
+    try:
+        scoring_params = SamplingParams(
+            temperature=1.0,
+            top_p=1.0,
+            max_tokens=0,
+            prompt_logprobs=1,
+        )
+    except TypeError:
+        logger.warning("prompt_logprobs not supported in this vLLM version; skipping temp=1.0 scoring")
+        return
+
+    prefix_ids = build_prefix_tokens_with_bos(prefix, tokenizer)
+    score_batch_size = max(1, min(64, batch_size))
+
+    for i in range(0, len(continuations), score_batch_size):
+        batch = continuations[i:i + score_batch_size]
+        prompts = [prefix + cont.text for cont in batch]
+        outputs = llm.generate(prompts, scoring_params, use_tqdm=False)
+
+        for j, (cont, out) in enumerate(zip(batch, outputs)):
+            prev_logprob = cont.logprob
+            prev_prob = cont.probability
+            prompt_logprobs = getattr(out, "prompt_logprobs", None)
+            if prompt_logprobs is None:
+                cont.logprob = float("-inf")
+                cont.probability = 0.0
+                continue
+
+            full_ids = build_prefix_tokens_with_bos(prefix + cont.text, tokenizer)
+            start_idx = len(prefix_ids)
+
+            # If prefix tokenization doesn't align, fall back to tokenization without BOS.
+            if full_ids[:start_idx] != prefix_ids:
+                prefix_ids_no = tokenizer(prefix, return_tensors="pt").input_ids[0].tolist()
+                full_ids_no = tokenizer(prefix + cont.text, return_tensors="pt").input_ids[0].tolist()
+                if full_ids_no[:len(prefix_ids_no)] == prefix_ids_no:
+                    full_ids = full_ids_no
+                    start_idx = len(prefix_ids_no)
+
+            logprob_sum = 0.0
+            n_tokens = 0
+            max_idx = min(len(full_ids), len(prompt_logprobs))
+            for idx in range(start_idx, max_idx):
+                lp = extract_logprob_for_token(prompt_logprobs[idx], full_ids[idx])
+                if lp is None:
+                    continue
+                logprob_sum += lp
+                n_tokens += 1
+
+            cont.logprob = logprob_sum if n_tokens > 0 else float("-inf")
+            if n_tokens > 0 and math.isfinite(cont.logprob):
+                cont.probability = math.exp(cont.logprob / n_tokens)
+            else:
+                cont.probability = 0.0
+
+            if i == 0 and j < 3:
+                logger.info(
+                    "Temp=1.0 rescore sample %d: logprob %+.4f -> %+.4f, prob %.4g -> %.4g",
+                    j,
+                    prev_logprob,
+                    cont.logprob,
+                    prev_prob,
+                    cont.probability,
+                )
+
+
 def sample_continuations_natural(
     llm: LLM,
     prefix: str,
@@ -248,6 +347,17 @@ def process_prefix(
     )
     
     logger.info(f"Sampled {len(continuations)} natural continuations")
+
+    if sampling_config.temperature != 1.0:
+        logger.info("Rescoring continuations at temperature=1.0 for logprob stability...")
+        compute_temp1_logprobs(
+            llm=llm,
+            tokenizer=tokenizer,
+            prefix=prefix,
+            continuations=continuations,
+            logger=logger,
+            batch_size=sampling_config.batch_size,
+        )
     
     # Step 3: Construct Output Format
     continuation_payload = continuations_to_payload(continuations, prefix_tokens_with_bos)

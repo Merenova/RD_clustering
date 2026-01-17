@@ -21,7 +21,7 @@ import json
 import logging
 import traceback
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Any, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -198,11 +198,13 @@ def run_clustering(
     convergence_threshold: float,
     logger,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
+    save_intermediate: bool = False,
+    intermediate_dir: Optional[Path] = None
 ):
     """Run the full R-D clustering algorithm for one prefix.
 
     Implements Algorithm 1 from rate_distortion.tex.
+    All computations use probability-weighted distortion and centers.
     """
     prefix_id = data["prefix_id"]
     embeddings_e = data["embeddings_e"].copy()
@@ -213,7 +215,7 @@ def run_clustering(
     logger.info(f"R-D CLUSTERING PREFIX: {prefix_id}")
     logger.info("=" * 60)
     logger.info(f"Parameters: β_e={beta_e}, β_a={beta_a}, K_max={K_max}")
-    logger.info(f"Metric: {metric_a}, Weighted: {use_weighted_distortion}")
+    logger.info(f"Metric: {metric_a}")
     logger.info(f"N samples: {len(path_probs)}")
 
     # Initialization
@@ -235,11 +237,11 @@ def run_clustering(
         "D_a": [],
     }
 
-    # Compute initial statistics
+    # Compute initial statistics (always probability-weighted)
     rd_stats = compute_full_rd_statistics(
         embeddings_e, attributions_a, assignments, path_probs,
         components, beta_e, beta_a,
-        metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+        metric_a=metric_a,
     )
 
     logger.info(f"Initial: {len(components)} component(s), L_RD={rd_stats['L_RD']:.4f}")
@@ -257,6 +259,46 @@ def run_clustering(
     if show_pbar:
         iterator = tqdm(iterator, desc="  EM Iterations", leave=False)
 
+    def serialize_components_snapshot(components_dict: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+        snapshot = {}
+        for c_id, comp in components_dict.items():
+            mu_e = comp.get("mu_e")
+            mu_a = comp.get("mu_a")
+            snapshot[str(c_id)] = {
+                "mu_e": mu_e.tolist() if hasattr(mu_e, "tolist") else mu_e,
+                "mu_a": mu_a.tolist() if hasattr(mu_a, "tolist") else mu_a,
+                "W_c": float(comp.get("W_c", 0.0)),
+            }
+        return snapshot
+
+    def maybe_save_intermediate(stage: str, iteration_idx: int, assignments_curr, rd_stats_curr):
+        if not save_intermediate or intermediate_dir is None:
+            return
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "prefix_id": prefix_id,
+            "stage": stage,
+            "iteration": iteration_idx + 1,
+            "n_components": len(components),
+            "assignments": [int(a) for a in assignments_curr],
+            "components": serialize_components_snapshot(components),
+            "rd_stats": {
+                "L_RD": float(rd_stats_curr.get("L_RD", 0.0)),
+                "H": float(rd_stats_curr.get("H", 0.0)),
+                "D_e": float(rd_stats_curr.get("D_e", 0.0)),
+                "D_a": float(rd_stats_curr.get("D_a", 0.0)),
+                "beta_e": float(rd_stats_curr.get("beta_e", beta_e)),
+                "beta_a": float(rd_stats_curr.get("beta_a", beta_a)),
+                "P_bar": {str(k): float(v) for k, v in rd_stats_curr.get("P_bar", {}).items()},
+                "Var_e": {str(k): float(v) for k, v in rd_stats_curr.get("Var_e", {}).items()},
+                "Var_a": {str(k): float(v) for k, v in rd_stats_curr.get("Var_a", {}).items()},
+            },
+        }
+        out_file = intermediate_dir / f"iter_{iteration_idx + 1:03d}_{stage}.json"
+        save_json(payload, out_file)
+
+    prev_assignments = np.array(assignments, copy=True)
+
     for iteration in iterator:
         logger.info(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
 
@@ -269,10 +311,13 @@ def run_clustering(
             beta_e,
             beta_a,
             metric_a=metric_a,
-            use_weighted_distortion=use_weighted_distortion
         )
 
         L_RD_curr = rd_stats['L_RD']
+
+        if not np.array_equal(prev_assignments, np.array(assignments)):
+            maybe_save_intermediate("em", iteration, assignments, rd_stats)
+            prev_assignments = np.array(assignments, copy=True)
 
         logger.info(f"After EM: K={len(components)}, L_RD={L_RD_curr:.4f}, "
                    f"H={rd_stats['H']:.4f}, D_e={rd_stats['D_e']:.4f}, D_a={rd_stats['D_a']:.4f}")
@@ -306,11 +351,11 @@ def run_clustering(
                 
                 Var_e[c] = compute_component_variance(
                     embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val,
-                    "l2", use_weighted_distortion
+                    "l2",
                 )
                 Var_a[c] = compute_component_variance(
                     attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val,
-                    metric_a, use_weighted_distortion
+                    metric_a,
                 )
 
         components, assignments, next_component_id = apply_adaptive_control(
@@ -327,7 +372,6 @@ def run_clustering(
             K_max,
             next_component_id,
             metric_a=metric_a,
-            use_weighted_distortion=use_weighted_distortion
         )
 
         logger.info(f"After adaptive: K={len(components)}")
@@ -338,9 +382,12 @@ def run_clustering(
                 embeddings_e, attributions_a, assignments, path_probs,
                 components, beta_e, beta_a,
                 metric_a=metric_a,
-                use_weighted_distortion=use_weighted_distortion
             )
             L_RD_curr = rd_stats['L_RD']
+
+        if not np.array_equal(prev_assignments, np.array(assignments)):
+            maybe_save_intermediate("adaptive", iteration, assignments, rd_stats)
+            prev_assignments = np.array(assignments, copy=True)
 
         # Track history
         history["iterations"].append(iteration + 1)
@@ -379,7 +426,6 @@ def run_clustering(
         # Hierarchical decomposition
         "H_0": data.get("H_0"),  # Global mean (shared attribution)
         "metric_a": metric_a,
-        "use_weighted_distortion": use_weighted_distortion
     }
 
 
@@ -407,7 +453,6 @@ def serialize_clustering_result(result: dict) -> dict:
         "converged": bool(result["converged"]),
         "n_components": len(result["components"]),
         "metric_a": result.get("metric_a", "l2"),
-        "use_weighted_distortion": result.get("use_weighted_distortion", True),
         # Hierarchical decomposition (shared components)
         "H_0": H_0.tolist() if H_0 is not None and hasattr(H_0, "tolist") else H_0,
         "rd_objective": {
@@ -460,6 +505,10 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             pooling=args.pooling,
         )
 
+        intermediate_dir = args.intermediate_dir
+        if args.save_intermediate and intermediate_dir is None:
+            intermediate_dir = args.output_dir / "intermediate"
+
         # Sweep mode: run sweep over (beta, gamma) grid
         sweep_results = run_sweep_mode(
             data,
@@ -470,7 +519,9 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             logger,
             n_workers=n_sweep_workers,
             metric_a=args.attribution_metric,
-            use_weighted_distortion=False
+            prefix_id=prefix_id,
+            intermediate_dir=intermediate_dir,
+            save_intermediate=args.save_intermediate
         )
 
         # Save sweep results
@@ -524,10 +575,14 @@ def main():
                         help="Pooling method for aggregating token attributions (default: mean)")
     parser.add_argument("--n-workers", type=int, default=1, help="Number of workers for parallel prefix processing")
     parser.add_argument("--quiet", action="store_true", help="Quiet mode (only progress bars)")
+    parser.add_argument("--save-intermediate", action="store_true",
+                        help="Save intermediate clustering snapshots when assignments change")
+    parser.add_argument("--intermediate-dir", type=Path, default=None,
+                        help="Base directory for intermediate snapshots (default: output_dir/intermediate)")
     
     # New Design Arguments
-    parser.add_argument("--attribution-metric", type=str, default="l2", choices=["l2", "l1"],
-                        help="Metric for attribution distance (default: l2)")
+    parser.add_argument("--attribution-metric", type=str, default="l1", choices=["l2", "l1"],
+                        help="Metric for attribution distance (default: l1)")
     args = parser.parse_args()
 
     # Load config if provided
@@ -662,7 +717,6 @@ def main():
         "parameters": {
             "K_max": args.K_max,
             "attribution_metric": args.attribution_metric,
-            "unweighted_distortion": True
         },
         "sweep_config": sweeps_config,
         "results": [

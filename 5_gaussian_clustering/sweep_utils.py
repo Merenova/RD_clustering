@@ -7,11 +7,14 @@ Provides functions for:
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 from sklearn.metrics import silhouette_score
 from tqdm import tqdm
+
+from utils.data_utils import save_json
 
 
 def compute_silhouette_scores(
@@ -115,12 +118,12 @@ def _run_single_config(args_tuple):
     Runs clustering for a single (beta, gamma) configuration.
 
     Args:
-        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion)
+        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, ...)
 
     Returns:
         Dict with beta, gamma, and clustering metrics
     """
-    data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion = args_tuple
+    data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate = args_tuple
 
     # Compute beta_e, beta_a
     beta_e = gamma * beta
@@ -160,15 +163,62 @@ def _run_single_config(args_tuple):
             "D_a": [],
         }
 
+        def serialize_components_snapshot(components_dict: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+            snapshot = {}
+            for c_id, comp in components_dict.items():
+                mu_e = comp.get("mu_e")
+                mu_a = comp.get("mu_a")
+                snapshot[str(c_id)] = {
+                    "mu_e": mu_e.tolist() if hasattr(mu_e, "tolist") else mu_e,
+                    "mu_a": mu_a.tolist() if hasattr(mu_a, "tolist") else mu_a,
+                    "W_c": float(comp.get("W_c", 0.0)),
+                }
+            return snapshot
+
+        def maybe_save_intermediate(stage: str, iteration_idx: int, assignments_curr, rd_stats_curr):
+            if not save_intermediate or not intermediate_dir or not prefix_id:
+                return
+            out_dir = Path(intermediate_dir) / prefix_id / f"beta{beta}_gamma{gamma}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "prefix_id": prefix_id,
+                "beta": float(beta),
+                "gamma": float(gamma),
+                "stage": stage,
+                "iteration": iteration_idx + 1,
+                "n_components": len(components),
+                "assignments": [int(a) for a in assignments_curr],
+                "components": serialize_components_snapshot(components),
+                "rd_stats": {
+                    "L_RD": float(rd_stats_curr.get("L_RD", 0.0)),
+                    "H": float(rd_stats_curr.get("H", 0.0)),
+                    "D_e": float(rd_stats_curr.get("D_e", 0.0)),
+                    "D_a": float(rd_stats_curr.get("D_a", 0.0)),
+                    "beta_e": float(rd_stats_curr.get("beta_e", beta_e)),
+                    "beta_a": float(rd_stats_curr.get("beta_a", beta_a)),
+                    "P_bar": {str(k): float(v) for k, v in rd_stats_curr.get("P_bar", {}).items()},
+                    "Var_e": {str(k): float(v) for k, v in rd_stats_curr.get("Var_e", {}).items()},
+                    "Var_a": {str(k): float(v) for k, v in rd_stats_curr.get("Var_a", {}).items()},
+                },
+            }
+            out_file = out_dir / f"iter_{iteration_idx + 1:03d}_{stage}.json"
+            save_json(payload, out_file)
+
+        prev_assignments = np.array(assignments, copy=True)
+
         # EM loop
         for iteration in range(max_iterations):
             assignments, components, rd_stats = run_em_iteration(
                 embeddings_e, attributions_a, path_probs,
                 components, beta_e, beta_a,
-                metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+                metric_a=metric_a,
             )
 
             L_RD_curr = rd_stats['L_RD']
+
+            if not np.array_equal(prev_assignments, np.array(assignments)):
+                maybe_save_intermediate("em", iteration, assignments, rd_stats)
+                prev_assignments = np.array(assignments, copy=True)
 
             # Adaptive control
             P_bar = rd_stats['P_bar']
@@ -187,27 +237,31 @@ def _run_single_config(args_tuple):
                         
                     Var_e[c] = compute_component_variance(
                         embeddings_e[indices], comp['mu_e'], path_probs[indices], W_c_val,
-                        "l2", use_weighted_distortion
+                        "l2",
                     )
                     Var_a[c] = compute_component_variance(
                         attributions_a[indices], comp['mu_a'], path_probs[indices], W_c_val,
-                        metric_a, use_weighted_distortion
+                        metric_a,
                     )
 
             components, assignments, next_component_id = apply_adaptive_control(
                 embeddings_e, attributions_a, path_probs,
                 assignments, components, P_bar, Var_e, Var_a,
                 beta_e, beta_a, K_max, next_component_id,
-                metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+                metric_a=metric_a,
             )
 
             if len(components) > 0:
                 rd_stats = compute_full_rd_statistics(
                     embeddings_e, attributions_a, assignments, path_probs,
                     components, beta_e, beta_a,
-                    metric_a=metric_a, use_weighted_distortion=use_weighted_distortion
+                    metric_a=metric_a,
                 )
                 L_RD_curr = rd_stats['L_RD']
+
+            if not np.array_equal(prev_assignments, np.array(assignments)):
+                maybe_save_intermediate("adaptive", iteration, assignments, rd_stats)
+                prev_assignments = np.array(assignments, copy=True)
 
             # Track history
             history["iterations"].append(iteration + 1)
@@ -278,7 +332,9 @@ def run_sweep_mode(
     logger,
     n_workers: int = 4,
     metric_a: str = "l2",
-    use_weighted_distortion: bool = True
+    prefix_id: Optional[str] = None,
+    intermediate_dir: Optional[Path] = None,
+    save_intermediate: bool = False
 ) -> Dict:
     """Run sweep over (beta, gamma) grid with parallel processing.
 
@@ -291,7 +347,6 @@ def run_sweep_mode(
         logger: Logger instance
         n_workers: Number of parallel workers
         metric_a: Attribution distance metric
-        use_weighted_distortion: Whether to use probability weights
 
     Returns:
         Dict with grid results
@@ -305,13 +360,13 @@ def run_sweep_mode(
     logger.info(f"Gamma values: {gamma_values}")
     logger.info(f"Total configurations: {len(beta_values) * len(gamma_values)}")
     logger.info(f"Workers: {n_workers}")
-    logger.info(f"Metric: {metric_a}, Weighted: {use_weighted_distortion}")
+    logger.info(f"Metric: {metric_a}")
 
     # Build task list
     tasks = []
     for beta in beta_values:
         for gamma in gamma_values:
-            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, use_weighted_distortion))
+            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate))
 
     # Run in parallel or sequential
     grid_results = []
@@ -356,7 +411,6 @@ def run_sweep_mode(
             "beta_values": beta_values,
             "gamma_values": gamma_values,
             "metric_a": metric_a,
-            "use_weighted_distortion": use_weighted_distortion
         },
         "grid": grid_results,
     }

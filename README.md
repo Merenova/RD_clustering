@@ -1,69 +1,22 @@
-# Mechanistic Motif Discovery via Rate-Distortion Clustering
+# Latent Planning: Rate-Distortion Clustering
 
-Unsupervised discovery of mechanistic motifs—clusters of LLM continuations that share both semantic meaning and internal computational patterns.
+Implementation of **Rate-Distortion two-view clustering** for analyzing semantic-attribution structure in language model continuations. This approach discovers latent semantic components by jointly optimizing over semantic embeddings and attribution features using rate-distortion theory.
 
 ## Overview
 
-When language models generate diverse continuations from the same prompt, different outputs may arise from different internal reasoning paths. This framework discovers these **mechanistic motifs** without requiring labels or pre-specified behaviors.
+Given a prefix (e.g., "The capital of France is"), this pipeline:
+1. Samples diverse continuations from the language model
+2. Computes circuit-tracer attributions from prefix features to continuation tokens
+3. Extracts semantic embeddings for each continuation
+4. Clusters continuations using a Rate-Distortion objective over both views
+5. Validates discovered clusters via steering interventions
 
-### Key Features
-
-- **Two-View Representation**: Each continuation is represented by both semantic embeddings (meaning) and attribution embeddings (internal computation)
-- **Rate-Distortion Clustering**: Automatically discovers the optimal number of motifs by balancing compression and reconstruction
-- **Multi-Granularity Analysis**: Adjust β to explore motifs at different levels of abstraction
-- **Steering Validation**: Verify discovered motifs are causally meaningful via activation interventions
-
-## Method
-
-### Pipeline
-```
-Prefix → Sample Continuations → Two-View Embedding → RD Clustering → Motifs
-                                      ↓                    ↓
-                              [Semantic, Attribution]  [Automatic K]
-                                                           ↓
-                                               Steering Validation
-```
-
-### Two-View Embedding
-
-| View | Source | Captures |
-|------|--------|----------|
-| Semantic | Pretrained embedding model | What the continuation means |
-| Attribution | Transcoder-based attribution | How the model computed it |
-
-### Rate-Distortion Objective
-```
-L_RD = H(C) + β_e · D^(e) + β_a · D^(a)
-       ───────   ─────────   ─────────
-        Rate     Semantic    Attribution
-                 Distortion  Distortion
-```
-
-- **Rate** H(C): Entropy of motif distribution (probability-weighted)
-- **Distortion**: Reconstruction error (L2 for semantic, L1 for attribution)
-- **β = β_e + β_a**: Controls number of motifs (higher → more motifs)
-- **γ = β_e / β**: Balances semantic vs attribution (higher → more semantic-focused)
-
-### Automatic K Selection
-
-The number of motifs K is not pre-specified. Adaptive split/merge operations derived from the objective automatically determine K:
-
-- **Split**: When distortion reduction > entropy cost
-- **Merge**: When entropy savings > distortion increase
-
-
-## Applications
-
-### Safety Analysis
-Discover different refusal mechanisms in safety-trained models:
-- Are all refusals using the same internal pathway?
-- Which refusal patterns are robust vs brittle?
-
-### Hallucination Detection
-Identify faithful vs shortcut reasoning:
-- Correct answers from genuine knowledge retrieval
-- Correct answers from pattern matching (brittle)
-
+**Key features:**
+- **Rate-Distortion objective**: Information-theoretic clustering with principled trade-offs
+- **Two-view clustering**: Joint optimization over semantic (embedding) and mechanistic (attribution) spaces
+- **Probability weighting**: Path probabilities weight all component statistics
+- **Steering validation**: Causal validation via feature steering interventions
+- **Flexible attribution spans**: Full continuation, distinguishing token, or post-LCS attribution (Default: full)
 
 ## Project Structure
 
@@ -154,11 +107,4 @@ Where:
 | **γ** | `clustering.gamma` | View ratio. 0.5 = equal weight; >0.5 favors semantic |
 | **K_max** | `clustering.K_max` | Maximum number of components |
 | **pooling** | `clustering.pooling` | Attribution pooling: `mean`, `max`, `sum` |
-
-
-## Citation
-TBD
-
-## License
-
-MIT License
+| **span_mode** | `attribution.span_mode` | Attribution span: `full`, `lcs_plus_one`, `post_lcs` |

@@ -521,7 +521,8 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             metric_a=args.attribution_metric,
             prefix_id=prefix_id,
             intermediate_dir=intermediate_dir,
-            save_intermediate=args.save_intermediate
+            save_intermediate=args.save_intermediate,
+            normalize_dims=args.normalize_dims
         )
 
         # Save sweep results
@@ -583,6 +584,9 @@ def main():
     # New Design Arguments
     parser.add_argument("--attribution-metric", type=str, default="l1", choices=["l2", "l1"],
                         help="Metric for attribution distance (default: l1)")
+    parser.add_argument("--normalize-dims", action="store_true",
+                        help="Normalize beta by dimensions: beta_e /= sqrt(d_e), beta_a /= d_a. "
+                             "This accounts for L2 scaling as sqrt(d) and L1 scaling as d.")
     args = parser.parse_args()
 
     # Load config if provided
@@ -604,7 +608,8 @@ def main():
 
         # Design arguments in config
         args.attribution_metric = clustering.get("attribution_metric", args.attribution_metric)
-        
+        args.normalize_dims = clustering.get("normalize_dims", args.normalize_dims)
+
         # Worker config from config file (if provided)
         # Note: --n-workers cli arg overrides this for prefix parallelism
         
@@ -645,6 +650,7 @@ def main():
     logger.info(f"Gamma values: {sweeps_config.get('gamma_values')}")
     logger.info(f"K_max: {args.K_max}")
     logger.info(f"Attribution Metric: {args.attribution_metric}")
+    logger.info(f"Dimension Normalization: {args.normalize_dims}")
     logger.info("Weighted Distortion: False")
     logger.info(f"GPU acceleration: {'enabled' if GPU_AVAILABLE else 'disabled'}")
 

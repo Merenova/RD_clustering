@@ -180,6 +180,7 @@ def split_operation(
     next_component_id: int,
     W_total: float,
     metric_a: str = "l2",
+    max_splits: int = 1,
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Split operation using exact rate-distortion criterion (optimized).
 
@@ -221,7 +222,10 @@ def split_operation(
                 for c in components.keys() if len(new_components) < K_max]
     to_split.sort(key=lambda x: x[1], reverse=True)
 
+    splits_done = 0
     for c, _ in to_split:
+        if splits_done >= max_splits:
+            break
         if len(new_components) >= K_max:
             break
 
@@ -380,6 +384,8 @@ def split_operation(
             if c in new_components:
                 del new_components[c]
 
+            splits_done += 1
+
     return new_components, new_assignments_arr.tolist(), next_component_id
 
 
@@ -394,6 +400,7 @@ def junk_operation(
     beta_a: float,
     W_total: float,
     metric_a: str = "l2",
+    max_junks: int = 1,
 ) -> Tuple[Dict[int, Dict], List[int]]:
     """Junk operation using exact rate-distortion criterion.
 
@@ -436,6 +443,9 @@ def junk_operation(
     junked = set()
 
     for c in list(components.keys()):
+        if len(junked) >= max_junks:
+            break
+
         if c in junked:
             continue
 
@@ -587,6 +597,8 @@ def apply_adaptive_control(
     K_max: int,
     next_component_id: int,
     metric_a: str = "l2",
+    max_splits_per_iter: int = 1,
+    max_junks_per_iter: int = 1,
 ) -> Tuple[Dict[int, Dict], List[int], int]:
     """Apply all adaptive control operations in sequence.
 
@@ -607,6 +619,8 @@ def apply_adaptive_control(
         K_max: Maximum components
         next_component_id: Next available component ID
         metric_a: Metric for attribution
+        max_splits_per_iter: Maximum number of splits per iteration (default 1)
+        max_junks_per_iter: Maximum number of junks per iteration (default 1)
 
     Returns:
         Tuple of (components, assignments, next_component_id)
@@ -621,6 +635,7 @@ def apply_adaptive_control(
         components, P_bar, Var_e, Var_a, beta_e, beta_a,
         K_max, next_component_id, W_total,
         metric_a=metric_a,
+        max_splits=max_splits_per_iter,
     )
 
     # Recompute P_bar and variances after split
@@ -655,6 +670,7 @@ def apply_adaptive_control(
         embeddings_e, attributions_a, path_probs, assignments,
         components, P_bar, beta_e, beta_a, W_total,
         metric_a=metric_a,
+        max_junks=max_junks_per_iter,
     )
 
     return components, assignments, next_component_id

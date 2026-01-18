@@ -118,16 +118,27 @@ def _run_single_config(args_tuple):
     Runs clustering for a single (beta, gamma) configuration.
 
     Args:
-        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, ...)
+        args_tuple: Tuple of (data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, ..., normalize_dims)
 
     Returns:
         Dict with beta, gamma, and clustering metrics
     """
-    data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate = args_tuple
+    data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate, normalize_dims = args_tuple
 
-    # Compute beta_e, beta_a
-    beta_e = gamma * beta
-    beta_a = (1 - gamma) * beta
+    # Get dimensions for normalization
+    d_e = data["embeddings_e"].shape[1]
+    d_a = data["attributions_a"].shape[1]
+
+    # Compute beta_e, beta_a with optional dimension normalization
+    # Dimension normalization accounts for:
+    # - L2 distance scales as sqrt(d_e)
+    # - L1 distance scales as d_a
+    if normalize_dims:
+        beta_e = gamma * beta / np.sqrt(d_e)
+        beta_a = (1 - gamma) * beta / d_a
+    else:
+        beta_e = gamma * beta
+        beta_a = (1 - gamma) * beta
 
     # Create a minimal logger for worker
     import logging
@@ -334,7 +345,8 @@ def run_sweep_mode(
     metric_a: str = "l2",
     prefix_id: Optional[str] = None,
     intermediate_dir: Optional[Path] = None,
-    save_intermediate: bool = False
+    save_intermediate: bool = False,
+    normalize_dims: bool = False
 ) -> Dict:
     """Run sweep over (beta, gamma) grid with parallel processing.
 
@@ -347,6 +359,10 @@ def run_sweep_mode(
         logger: Logger instance
         n_workers: Number of parallel workers
         metric_a: Attribution distance metric
+        prefix_id: Prefix identifier for intermediate saves
+        intermediate_dir: Directory for intermediate results
+        save_intermediate: Whether to save intermediate results
+        normalize_dims: Whether to normalize beta by dimensions (beta_e /= sqrt(d_e), beta_a /= d_a)
 
     Returns:
         Dict with grid results
@@ -361,12 +377,19 @@ def run_sweep_mode(
     logger.info(f"Total configurations: {len(beta_values) * len(gamma_values)}")
     logger.info(f"Workers: {n_workers}")
     logger.info(f"Metric: {metric_a}")
+    logger.info(f"Dimension normalization: {normalize_dims}")
+    if normalize_dims:
+        d_e = data["embeddings_e"].shape[1]
+        d_a = data["attributions_a"].shape[1]
+        logger.info(f"  d_e={d_e}, d_a={d_a}")
+        logger.info(f"  beta_e will be divided by sqrt({d_e})={np.sqrt(d_e):.1f}")
+        logger.info(f"  beta_a will be divided by {d_a}")
 
     # Build task list
     tasks = []
     for beta in beta_values:
         for gamma in gamma_values:
-            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate))
+            tasks.append((data, beta, gamma, K_max, max_iterations, convergence_threshold, metric_a, prefix_id, intermediate_dir, save_intermediate, normalize_dims))
 
     # Run in parallel or sequential
     grid_results = []
@@ -403,6 +426,8 @@ def run_sweep_mode(
 
     # Build sweep results
     H_0 = data.get("H_0")
+    d_e = data["embeddings_e"].shape[1]
+    d_a = data["attributions_a"].shape[1]
     sweep_results = {
         "prefix_id": data["prefix_id"],
         "prefix": data.get("prefix"),
@@ -411,6 +436,9 @@ def run_sweep_mode(
             "beta_values": beta_values,
             "gamma_values": gamma_values,
             "metric_a": metric_a,
+            "normalize_dims": normalize_dims,
+            "d_e": d_e,
+            "d_a": d_a,
         },
         "grid": grid_results,
     }

@@ -13,8 +13,6 @@ Features:
 
 import sys
 
-# Prevent version conflicts with global packages
-sys.path = [p for p in sys.path if 'python3.12' not in p]
 
 import argparse
 import json

@@ -335,14 +335,30 @@ def main():
                 continue
 
             grid_results = clustering_sweep.get("grid", [])
-            valid_grid = [
-                entry for entry in grid_results
-                if entry.get("components") and entry.get("assignments") and "error" not in entry
-            ]
+
+            # Get K_max from sweep config (default 20)
+            sweep_config = clustering_sweep.get("sweep_config", {})
+            K_max = sweep_config.get("K_max", 20)
+
+            # Filter: valid entries with intermediate K (not 1 and not K_max)
+            valid_grid = []
+            skipped_boundary = []
+            for entry in grid_results:
+                if not entry.get("components") or not entry.get("assignments") or "error" in entry:
+                    continue
+                K = entry.get("K", len(entry.get("components", {})))
+                if K == 1 or K == K_max:
+                    skipped_boundary.append((entry.get("beta"), entry.get("gamma"), K))
+                    continue
+                valid_grid.append(entry)
+
+            if skipped_boundary:
+                logger.info(f"  Skipped {len(skipped_boundary)} configs with K=1 or K={K_max}: {skipped_boundary[:5]}{'...' if len(skipped_boundary) > 5 else ''}")
+
             if not valid_grid:
-                logger.warning(f"  No valid clustering results for {prefix_id}")
+                logger.warning(f"  No valid clustering results for {prefix_id} (all K=1 or K={K_max})")
                 failed_ids.append(prefix_id)
-                errors[prefix_id] = "No valid clustering results"
+                errors[prefix_id] = f"No valid clustering results (all K=1 or K={K_max})"
                 continue
 
             processed_any = False

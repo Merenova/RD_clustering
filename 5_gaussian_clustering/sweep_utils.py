@@ -435,6 +435,7 @@ def run_sweep_mode(
         "sweep_config": {
             "beta_values": beta_values,
             "gamma_values": gamma_values,
+            "K_max": K_max,
             "metric_a": metric_a,
             "normalize_dims": normalize_dims,
             "d_e": d_e,

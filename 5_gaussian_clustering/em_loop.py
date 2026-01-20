@@ -111,9 +111,9 @@ def rd_e_step(
     rate_costs = np.array([-np.log(P_bar.get(c, eps) + eps) for c in component_ids], dtype=np.float32)
 
     # Try GPU acceleration for large datasets (lowered threshold from 10000 to 1000)
-    # GPU path currently only supports L2
+    # GPU path supports both L2 and L1 metrics
     backend = None
-    if use_gpu and GPU_AVAILABLE and n_samples >= 1000 and metric_a == "l2":
+    if use_gpu and GPU_AVAILABLE and n_samples >= 1000:
         backend = get_compute_backend(use_gpu=True, n_samples=n_samples)
 
     if backend is not None and hasattr(backend, 'name') and backend.name == "torch":
@@ -122,7 +122,8 @@ def rd_e_step(
             embeddings_e.astype(np.float32),
             attributions_a.astype(np.float32),
             centers_e, centers_a, rate_costs,
-            beta_e, beta_a
+            beta_e, beta_a,
+            metric_a=metric_a,
         )
     else:
         # CPU vectorized computation using helper functions

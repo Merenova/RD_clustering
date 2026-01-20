@@ -121,10 +121,11 @@ class TorchBackend:
         rate_costs: np.ndarray,
         beta_e: float,
         beta_a: float,
+        metric_a: str = "l2",
     ) -> np.ndarray:
         """GPU-accelerated E-step using PyTorch.
 
-        Uses raw squared distances (no MSE normalization).
+        Supports both L2 (squared) and L1 distances.
 
         Args:
             embeddings_e: (N, d_e)
@@ -133,6 +134,7 @@ class TorchBackend:
             centers_a: (K, d_a)
             rate_costs: (K,)
             beta_e, beta_a: distortion weights
+            metric_a: "l2" or "l1" for attribution distance
 
         Returns:
             best_indices: (N,) numpy array of best component indices
@@ -144,13 +146,18 @@ class TorchBackend:
         mu_a = torch.from_numpy(centers_a).float().to(self.device)
         rates = torch.from_numpy(rate_costs).float().to(self.device)
 
-        # Compute squared distances using cdist
+        # Embeddings always use L2 squared distance
         # cdist returns (N, K) for (N, d) and (K, d)
         dist_e_sq = torch.cdist(e, mu_e, p=2) ** 2
-        dist_a_sq = torch.cdist(a, mu_a, p=2) ** 2
+        
+        # Attributions use specified metric
+        if metric_a == "l1":
+            dist_a = torch.cdist(a, mu_a, p=1)  # L1 distance (not squared)
+        else:
+            dist_a = torch.cdist(a, mu_a, p=2) ** 2  # L2 squared
 
         # Total cost: (N, K)
-        total_cost = rates.unsqueeze(0) + beta_e * dist_e_sq + beta_a * dist_a_sq
+        total_cost = rates.unsqueeze(0) + beta_e * dist_e_sq + beta_a * dist_a
 
         # Find best assignment
         best_indices = torch.argmin(total_cost, dim=1)

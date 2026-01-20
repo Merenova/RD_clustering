@@ -320,7 +320,8 @@ def build_semantic_graphs_from_kmeans(
 ) -> Dict[int, np.ndarray]:
     """Build semantic graphs (H_c) from K-means assignments.
     
-    For each cluster, computes H_c = H_0 + weighted_center(attributions - H_0)
+    For each cluster, computes Delta_H_c = weighted_center(attributions - H_0)
+    and uses Delta_H_c directly as H_c.
     
     Args:
         assignments: Cluster assignments [n_samples]
@@ -349,9 +350,8 @@ def build_semantic_graphs_from_kmeans(
                 attributions_centered, assignments, path_probs, c
             )
         
-        # H_c = H_0 + Delta_H_c
-        H_c = H_0 + Delta_H_c
-        semantic_graphs[c] = H_c
+        # Use Delta_H_c directly (no H_0 added back)
+        semantic_graphs[c] = Delta_H_c
     
     return semantic_graphs
 

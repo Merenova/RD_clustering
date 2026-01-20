@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.logging_utils import setup_logger
 from utils.data_utils import save_json, load_json
 
-from downstream.config import OUTPUT_DIR
+from downstream.config import OUTPUT_DIR, ROLLOUT_CONFIG
 
 
 def run_safety_pipeline(output_dir: Path, logger, args):
@@ -225,7 +225,7 @@ def main():
     parser.add_argument("--mode", choices=["all", "safety", "hallucination"], default="all")
     parser.add_argument("--n-prompts", type=int, default=150, help="N prompts for safety")
     parser.add_argument("--n-questions", type=int, default=200, help="N questions for hallucination")
-    parser.add_argument("--n-continuations", type=int, default=10)
+    parser.add_argument("--n-continuations", type=int, default=ROLLOUT_CONFIG["n_continuations"])
     
     # Skip flags
     parser.add_argument("--skip-rollout", action="store_true")

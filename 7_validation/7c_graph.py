@@ -83,7 +83,7 @@ def compute_semantic_graphs(
     H_0: np.ndarray,
     logger=None
 ) -> Dict[int, np.ndarray]:
-    """Compute semantic graphs using H_c = H_0 + Delta_H_c."""
+    """Compute semantic graphs using Delta_H_c directly (no H_0 added)."""
     delta_H_c_dict = {}
     for c_str, comp in components.items():
         c = int(c_str)
@@ -93,15 +93,12 @@ def compute_semantic_graphs(
     if not delta_H_c_dict:
         return {}
 
-    if H_0 is None:
-        raise ValueError("H_0 is required for H_c computation but was not provided")
-
     semantic_graphs = {}
     for c, delta_H_c in delta_H_c_dict.items():
-        semantic_graphs[c] = H_0 + delta_H_c
+        semantic_graphs[c] = delta_H_c
 
     if logger:
-        logger.info(f"  Using H_c strategy: H_0 + Delta_H_c (||H_0||={np.linalg.norm(H_0):.4f})")
+        logger.info("  Using H_c strategy: Delta_H_c directly (no H_0 added)")
 
     return semantic_graphs
 

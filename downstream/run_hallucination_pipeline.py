@@ -27,6 +27,7 @@ from downstream.config import (
     OUTPUT_DIR,
     HALLUCINATION_CONFIG,
     ATTRIBUTION_CONFIG,
+    ROLLOUT_CONFIG,
     DEFAULT_SEED,
 )
 
@@ -35,7 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Hallucination Motif Discovery Pipeline")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "hallucination_pipeline")
     parser.add_argument("--n-questions", type=int, default=HALLUCINATION_CONFIG["n_questions_initial"])
-    parser.add_argument("--n-continuations", type=int, default=10)
+    parser.add_argument("--n-continuations", type=int, default=ROLLOUT_CONFIG["n_continuations"])
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     
     # Stage flags
@@ -219,14 +220,13 @@ def main():
         filtered_results = emb_data["filtered_results"].tolist()
     
     # Flatten for clustering - track valid indices per question
-    # Collect BOTH pooled and non-pooled attributions:
-    # - Non-pooled (attributions): For Exp6 (single-dataset clustering)
-    # - Pooled (attributions_pooled): For Exp4 (cross-prefix clustering)
+    # For cross-question operations (clustering sweep, Exp1, Exp2, Exp4), we need pooled attributions
+    # because different questions have different prefix lengths (different n_prefix_sources)
+    # Position-specific attributions are kept per-question in filtered_results for potential per-question use
     import numpy as np
     
     all_embeddings = []
-    all_attributions = []         # Non-pooled for Exp6
-    all_attributions_pooled = []  # Pooled for Exp4
+    all_attributions_pooled = []  # Pooled for all cross-question operations
     all_labels = []
     
     # Track valid sample indices per question for Exp4
@@ -236,28 +236,23 @@ def main():
     for result in filtered_results:
         q_idx = result.get("question_idx", len(per_question_valid_indices))
         embs = result.get("embeddings", [])
-        attrs = result.get("attributions", [])
         attrs_pooled = result.get("attributions_pooled", [])
         conts = result.get("continuations", [])
         
         if isinstance(embs, np.ndarray):
             embs = embs.tolist()
-        if isinstance(attrs, np.ndarray):
-            attrs = attrs.tolist()
         if isinstance(attrs_pooled, np.ndarray):
             attrs_pooled = attrs_pooled.tolist()
         
         valid_indices = []
         for i in range(len(embs)):
             e = embs[i] if i < len(embs) else None
-            a = attrs[i] if i < len(attrs) else None
             a_pooled = attrs_pooled[i] if i < len(attrs_pooled) else None
             
-            if e is not None and a is not None:
+            # Filter by pooled attribution presence (consistent shape across questions)
+            if e is not None and a_pooled is not None:
                 all_embeddings.append(e)
-                all_attributions.append(a)
-                # Pooled might be None if compute_pooled was False
-                all_attributions_pooled.append(a_pooled if a_pooled is not None else a)
+                all_attributions_pooled.append(a_pooled)
                 if i < len(conts):
                     label = conts[i].get("is_correct", False) if isinstance(conts[i], dict) else False
                 else:
@@ -269,8 +264,9 @@ def main():
         per_question_valid_indices[q_idx] = valid_indices
     
     embeddings_e = np.array(all_embeddings) if all_embeddings else np.array([])
-    attributions_a = np.array(all_attributions) if all_attributions else np.array([])
-    attributions_a_pooled = np.array(all_attributions_pooled) if all_attributions_pooled else np.array([])
+    # Use pooled attributions for all cross-question operations (consistent shape)
+    attributions_a = np.array(all_attributions_pooled) if all_attributions_pooled else np.array([])
+    attributions_a_pooled = attributions_a  # Alias for clarity
     labels = np.array(all_labels, dtype=int)
     
     logger.info(f"Total samples for clustering: {len(embeddings_e)}")

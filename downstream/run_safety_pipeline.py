@@ -27,6 +27,7 @@ from downstream.config import (
     OUTPUT_DIR,
     SAFETY_CONFIG,
     ATTRIBUTION_CONFIG,
+    ROLLOUT_CONFIG,
     DEFAULT_SEED,
 )
 
@@ -35,7 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Safety Motif Discovery Pipeline")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR / "safety_pipeline")
     parser.add_argument("--n-prompts", type=int, default=SAFETY_CONFIG["n_prompts"])
-    parser.add_argument("--n-continuations", type=int, default=10)
+    parser.add_argument("--n-continuations", type=int, default=ROLLOUT_CONFIG["n_continuations"])
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     
     # Stage flags
@@ -233,22 +234,22 @@ def main():
             )
             
             # Extract arrays - filter out samples with missing embeddings
-            instruct_valid = [d for d in instruct_data if d.get("embedding") is not None and d.get("attribution") is not None]
-            base_valid = [d for d in base_data if d.get("embedding") is not None and d.get("attribution") is not None]
+            # For cross-prefix experiments (safety), we need pooled attributions
+            # Position-specific attributions have different shapes per prefix (due to error/token nodes)
+            instruct_valid = [d for d in instruct_data 
+                              if d.get("embedding") is not None and d.get("attribution_pooled") is not None]
+            base_valid = [d for d in base_data 
+                          if d.get("embedding") is not None and d.get("attribution_pooled") is not None]
             
             instruct_embeddings = np.stack([d["embedding"] for d in instruct_valid])
-            instruct_attributions = np.stack([d["attribution"] for d in instruct_valid])
-            # Pooled attributions for cross-model comparison (Exp5)
-            instruct_attributions_pooled = np.stack([
-                d.get("attribution_pooled", d["attribution"]) for d in instruct_valid
-            ])
+            # For cross-prefix clustering, use pooled attributions (consistent shape across prefixes)
+            # Position-specific attributions can't be stacked across different prefixes
+            instruct_attributions_pooled = np.stack([d["attribution_pooled"] for d in instruct_valid])
+            instruct_attributions = instruct_attributions_pooled  # Use pooled for all cross-prefix experiments
             
             base_embeddings = np.stack([d["embedding"] for d in base_valid])
-            base_attributions = np.stack([d["attribution"] for d in base_valid])
-            # Pooled attributions for cross-model comparison (Exp5)
-            base_attributions_pooled = np.stack([
-                d.get("attribution_pooled", d["attribution"]) for d in base_valid
-            ])
+            base_attributions_pooled = np.stack([d["attribution_pooled"] for d in base_valid])
+            base_attributions = base_attributions_pooled  # Use pooled for all cross-prefix experiments
             
             # Update data lists to only include valid samples (remove numpy arrays for JSON)
             instruct_data = [{k: v for k, v in d.items() if k not in ("embedding", "attribution", "attribution_pooled")} for d in instruct_valid]
@@ -261,10 +262,11 @@ def main():
             np.savez(
                 embed_file,
                 instruct_embeddings=instruct_embeddings,
-                instruct_attributions=instruct_attributions,
+                # For cross-prefix: both are pooled (position-specific can't be stacked across prefixes)
+                instruct_attributions=instruct_attributions_pooled,
                 instruct_attributions_pooled=instruct_attributions_pooled,
                 base_embeddings=base_embeddings,
-                base_attributions=base_attributions,
+                base_attributions=base_attributions_pooled,
                 base_attributions_pooled=base_attributions_pooled,
             )
             logger.info(f"Saved embeddings to {embed_file}")

@@ -73,28 +73,31 @@ def run_experiment_6(
         logger.info(f"N questions: {len(data)}")
     
     # Flatten data for clustering
+    # Use pooled attributions for cross-question clustering (consistent shape)
+    # Position-specific attributions have different shapes per question (different prefix lengths)
     all_embeddings = []
-    all_attributions = []
+    all_attributions_pooled = []
     all_labels = []  # Correctness labels
     all_probs = []
     sample_info = []  # Track which question each sample belongs to
     
     for q_idx, q_data in enumerate(data):
         embeddings = q_data.get("embeddings", [])
-        attributions = q_data.get("attributions", [])
+        # Use pooled attributions for cross-question operations
+        attributions_pooled = q_data.get("attributions_pooled", q_data.get("attributions", []))
         continuations = q_data.get("continuations", [])
         
         if isinstance(embeddings, np.ndarray):
             embeddings = embeddings.tolist()
-        if isinstance(attributions, np.ndarray):
-            attributions = attributions.tolist()
+        if isinstance(attributions_pooled, np.ndarray):
+            attributions_pooled = attributions_pooled.tolist()
         
-        for i, (emb, attr) in enumerate(zip(embeddings, attributions)):
+        for i, (emb, attr) in enumerate(zip(embeddings, attributions_pooled)):
             if emb is None or attr is None:
                 continue
             
             all_embeddings.append(emb)
-            all_attributions.append(attr)
+            all_attributions_pooled.append(attr)
             
             # Get label
             if i < len(continuations):
@@ -119,7 +122,7 @@ def run_experiment_6(
         return {"error": "No valid samples"}
     
     embeddings_e = np.array(all_embeddings)
-    attributions_a = np.array(all_attributions)
+    attributions_a = np.array(all_attributions_pooled)
     labels = np.array(all_labels, dtype=int)
     # Note: path_probs not used for weighting - use uniform weights
     # Keeping all_probs for potential future use but not passing to clustering

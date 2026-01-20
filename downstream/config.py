@@ -22,12 +22,12 @@ CIRCUIT_TRACER_PATH = BASE_DIR / "circuit-tracer"
 # =============================================================================
 # Primary model for downstream experiments
 # Note: Qwen3-4B is the instruct/reasoning version, Qwen3-4B-Base is the base
-BASE_MODEL_NAME = "Qwen/Qwen3-4B-Base"
-INSTRUCT_MODEL_NAME = "Qwen/Qwen3-4B"
+BASE_MODEL_NAME = "Qwen/Qwen3-8B-Base"
+INSTRUCT_MODEL_NAME = "Qwen/Qwen3-8B"
 
 # Transcoder is trained on instruct model but can be used for both
 # (same architecture, just different weights)
-TRANSCODER_SET = "mwhanna/qwen3-4b-transcoders"
+TRANSCODER_SET = "mwhanna/qwen3-8b-transcoders"
 
 # Default model for attribution (instruct, since transcoder trained on it)
 DEFAULT_ATTRIBUTION_MODEL = INSTRUCT_MODEL_NAME
@@ -76,7 +76,7 @@ EMBEDDING_CONFIG = {
 # Attribution Configuration
 # =============================================================================
 ATTRIBUTION_CONFIG = {
-    "batch_size": 64,
+    "batch_size": 16,
     "max_feature_nodes": 4096,
     "add_bos": False,
     # Position pooling for cross-prefix clustering (Exp4, Exp5)
@@ -91,16 +91,17 @@ CLUSTERING_CONFIG = {
     "K_max": 20,
     "max_iterations": 50,
     "convergence_threshold": 1e-3,
-    "metric_a": "l1",  # "l2" or "l1"
+    "metric_a": "l1",  # "l2" or "l1" - both now support GPU acceleration
     "normalize_dims": True,  # Normalize beta by dimensions (beta_e /= sqrt(d_e), beta_a /= d_a)
 }
 
 # Hyperparameter sweep (values for normalize_dims=True)
 # With dimension normalization, beta controls rate-distortion trade-off in dimension-invariant way
 # gamma=0.5 truly balances embedding vs attribution
-BETA_VALUES = [300, 400, 500, 600, 700, 800]
+# BETA_VALUES = [300, 400, 500, 600, 700, 800]
+# GAMMA_VALUES = [0.3, 0.5, 0.7]
+BETA_VALUES = [1.0, 3.0, 5.0]
 GAMMA_VALUES = [0.3, 0.5, 0.7]
-
 # =============================================================================
 # Safety Task (HarmBench) Configuration
 # =============================================================================
@@ -183,6 +184,4 @@ ROBUSTNESS_CONFIG = {
 # Default Parameters
 # =============================================================================
 DEFAULT_SEED = 42
-DEFAULT_N_QUESTIONS = 50
-DEFAULT_SAMPLES_PER_QUESTION = 100
 

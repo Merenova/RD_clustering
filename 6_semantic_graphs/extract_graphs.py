@@ -145,9 +145,9 @@ def extract_semantic_graphs(
     # Convert components to numpy arrays
     # With hierarchical decomposition:
     #   - mu_a in clustering is Delta_H_c (centered)
-    #   - mu_a_full = H_0 + Delta_H_c (full, for backward compat)
-    semantic_graphs = {}  # Full H_c = H_0 + Delta_H_c (backward compat)
-    semantic_graphs_centered = {}  # Delta_H_c (centered)
+    # We use Delta_H_c directly as H_c (no H_0 added back).
+    semantic_graphs = {}  # Delta_H_c directly
+    semantic_graphs_centered = {}  # Same as semantic_graphs
     component_ids = []
 
     for c_str, comp in components.items():
@@ -158,12 +158,8 @@ def extract_semantic_graphs(
         Delta_H_c = np.array(comp["mu_a"])
         semantic_graphs_centered[c] = Delta_H_c
 
-        # Full H_c = H_0 + Delta_H_c (for backward compatibility)
-        if H_0 is not None:
-            H_c_full = H_0 + Delta_H_c
-        else:
-            H_c_full = Delta_H_c
-        semantic_graphs[c] = H_c_full
+        # Use Delta_H_c directly (no H_0 added back)
+        semantic_graphs[c] = Delta_H_c
 
     # Compute soft node memberships σ_{j,c}
     soft_node_memberships = None
@@ -194,9 +190,9 @@ def extract_semantic_graphs(
     return {
         # Hierarchical decomposition (shared components)
         "H_0": H_0,  # Global mean (shared attribution)
-        # Full versions (H_c = H_0 + Delta_H_c) for backward compatibility
+        # Delta_H_c directly
         "semantic_graphs": semantic_graphs,
-        # Centered versions (Delta_H_c)
+        # Same as semantic_graphs
         "semantic_graphs_centered": semantic_graphs_centered,
         # Other fields
         "soft_node_memberships": soft_node_memberships,

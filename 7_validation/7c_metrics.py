@@ -174,6 +174,13 @@ def compute_cluster_mass_metrics(
     Cluster mass = sum of probabilities (exp(log_P)) across all continuations in cluster.
     This is more robust than mean of relative changes which can be skewed by outliers.
 
+    NOTE: In practice, these masses can be extremely tiny (e.g., ~1e-200) because each
+    continuation probability is a product over many tokens. To make the metric numerically
+    stable and interpretable, we also compute:
+        - cluster_log_mass_* = log(sum(exp(log_P))) using stable log-sum-exp
+        - delta_log_mass = log_mass_steered - log_mass_original
+      and correlate delta_log_mass with epsilon.
+
     Args:
         log_probs_steered: {cluster_id: {epsilon: [log_P_steered]}}
         log_probs_original: {cluster_id: {epsilon: [log_P_original]}}
@@ -185,15 +192,34 @@ def compute_cluster_mass_metrics(
         - cluster_mass_steered: Sum of P(continuation) in cluster (steered)
         - cluster_relative_diff: (mass_steered - mass_original) / mass_original
         - cluster_win_rate: 1 if mass_steered > mass_original, 0 otherwise
+        - cluster_log_mass_original: log(sum(exp(log_P_original))) (stable)
+        - cluster_log_mass_steered: log(sum(exp(log_P_steered))) (stable)
+        - delta_log_mass: cluster_log_mass_steered - cluster_log_mass_original
     """
     cluster_ids = sorted(log_probs_steered.keys())
     per_cluster_mass_stats = {}
+
+    def _logsumexp(vals: List[float]) -> float:
+        """Stable log(sum(exp(vals))) for Python floats."""
+        if not vals:
+            return 0.0
+        v = np.asarray(vals, dtype=np.float64)
+        if v.size == 0:
+            return 0.0
+        m = float(np.max(v))
+        # if all -inf, return -inf (but shouldn't happen with finite log probs)
+        if not np.isfinite(m):
+            return -np.inf
+        return float(m + np.log(np.sum(np.exp(v - m))))
 
     for c in cluster_ids:
         mass_original = []
         mass_steered = []
         relative_diffs = []
         win_rates = []
+        log_mass_original = []
+        log_mass_steered = []
+        delta_log_mass = []
 
         for eps in epsilons:
             log_P_orig = log_probs_original[c].get(eps, [])
@@ -204,11 +230,19 @@ def compute_cluster_mass_metrics(
                 mass_steered.append(0.0)
                 relative_diffs.append(0.0)
                 win_rates.append(0.0)
+                log_mass_original.append(0.0)
+                log_mass_steered.append(0.0)
+                delta_log_mass.append(0.0)
                 continue
 
             # Cluster mass = sum of probabilities
             m_orig = float(np.sum(np.exp(log_P_orig)))
             m_steer = float(np.sum(np.exp(log_P_steer)))
+
+            # Stable log-mass (log-sum-exp)
+            lm_orig = _logsumexp(log_P_orig)
+            lm_steer = _logsumexp(log_P_steer)
+            dlm = lm_steer - lm_orig
 
             # Relative difference
             if m_orig != 0:
@@ -223,11 +257,18 @@ def compute_cluster_mass_metrics(
             mass_steered.append(m_steer)
             relative_diffs.append(rel_diff)
             win_rates.append(win)
+            log_mass_original.append(lm_orig)
+            log_mass_steered.append(lm_steer)
+            delta_log_mass.append(dlm)
 
         # Compute correlation for cluster mass relative diff
         X = np.array(epsilons)
         Y = np.array(relative_diffs)
         mass_corr, mass_r2 = compute_correlation_and_r2(X, Y)
+
+        # Compute correlation for delta_log_mass (stable)
+        Y_log = np.array(delta_log_mass)
+        log_mass_corr, log_mass_r2 = compute_correlation_and_r2(X, Y_log)
 
         # Compute correlation for cluster mass win rate
         Y_win = np.array(win_rates)
@@ -240,6 +281,11 @@ def compute_cluster_mass_metrics(
             'cluster_win_rate': {eps: win_rates[i] for i, eps in enumerate(epsilons)},
             'cluster_mass_r2': mass_r2,
             'cluster_mass_corr': mass_corr,
+            'cluster_log_mass_original': {eps: log_mass_original[i] for i, eps in enumerate(epsilons)},
+            'cluster_log_mass_steered': {eps: log_mass_steered[i] for i, eps in enumerate(epsilons)},
+            'delta_log_mass': {eps: delta_log_mass[i] for i, eps in enumerate(epsilons)},
+            'delta_log_mass_r2': log_mass_r2,
+            'delta_log_mass_corr': log_mass_corr,
             'cluster_mass_win_r2': mass_win_r2,
             'cluster_mass_win_corr': mass_win_corr,
             'n_samples': len(log_P_orig) if log_P_orig else 0

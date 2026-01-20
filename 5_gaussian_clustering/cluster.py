@@ -40,7 +40,7 @@ from utils.manifest import update_manifest_with_results
 
 # Import R-D clustering modules
 from initialize import initialize_single_component
-from em_loop import run_em_iteration, check_convergence, GPU_AVAILABLE
+from em_loop import run_em_iteration, check_convergence, GPU_AVAILABLE, weighted_median
 from adaptive_control import apply_adaptive_control
 from rd_objective import (
     compute_component_masses,
@@ -52,11 +52,23 @@ from rd_objective import (
 from sweep_utils import run_sweep_mode
 
 
-def compute_global_mean(attributions_a: np.ndarray, path_probs: np.ndarray) -> np.ndarray:
-    """Compute H_0 = probability-weighted global mean of attributions."""
-    W_total = path_probs.sum()
-    if W_total == 0:
+def compute_global_center(
+    attributions_a: np.ndarray,
+    path_probs: np.ndarray,
+    metric_a: str = "l2",
+) -> np.ndarray:
+    """Compute H_0 (shared attribution center) consistent with attribution distortion.
+
+    - metric_a == "l1": probability-weighted coordinate-wise median (minimizes weighted L1)
+    - metric_a == "l2": probability-weighted mean (minimizes weighted squared L2)
+    """
+    W_total = float(path_probs.sum())
+    if W_total <= 0:
         return np.zeros(attributions_a.shape[1])
+
+    if metric_a == "l1":
+        return weighted_median(attributions_a, path_probs)
+
     return np.sum(path_probs[:, None] * attributions_a, axis=0) / W_total
 
 
@@ -67,6 +79,7 @@ def load_prefix_data(
     samples_dir: Path,
     logger,
     pooling: str = "mean",
+    metric_a: str = "l2",
 ):
     """Load all data for a single prefix."""
     logger.info(f"Loading data for prefix: {prefix_id}")
@@ -148,8 +161,9 @@ def load_prefix_data(
 
     logger.info(f"Attribution embeddings: shape {attributions_a.shape}")
 
-    # Compute H_0 (global weighted mean) BEFORE clustering
-    H_0 = compute_global_mean(attributions_a, path_probs)
+    # Compute H_0 (shared attribution center) BEFORE clustering.
+    # IMPORTANT: for L1 attribution distortion, we center by weighted median (not mean).
+    H_0 = compute_global_center(attributions_a, path_probs, metric_a=metric_a)
     logger.info(f"Computed H_0: ||H_0|| = {np.linalg.norm(H_0):.4f}")
 
     # Center attributions for clustering (clustering operates on Delta_H)
@@ -219,7 +233,7 @@ def run_clustering(
     # Initialization
     logger.info("Initializing with single component (K=1)...")
     components, assignments = initialize_single_component(
-        embeddings_e, attributions_a, path_probs
+        embeddings_e, attributions_a, path_probs, metric_a=metric_a
     )
 
     # Initialize tracking
@@ -501,6 +515,7 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             args.samples_dir,
             logger,
             pooling=args.pooling,
+            metric_a=args.attribution_metric,
         )
 
         intermediate_dir = args.intermediate_dir

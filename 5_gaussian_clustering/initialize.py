@@ -10,11 +10,14 @@ Also supports warm-start from previous solution for β-annealing.
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
+from em_loop import weighted_median
+
 
 def initialize_single_component(
     embeddings_e: np.ndarray,
     attributions_a: np.ndarray,
     path_probs: np.ndarray,
+    metric_a: str = "l2",
 ) -> Tuple[Dict[int, Dict], List[int]]:
     """Initialize with a single component containing all points.
 
@@ -27,10 +30,12 @@ def initialize_single_component(
         Tuple of (components dict, assignments list)
     """
     n_samples = len(path_probs)
-    W_total = np.sum(path_probs)
+    W_total = float(np.sum(path_probs))
 
-    if W_total == 0:
-        W_total = 1.0  # Avoid division by zero
+    if W_total <= 0:
+        # Fall back to uniform weights to avoid degenerate all-zero weighting.
+        path_probs = np.ones(n_samples, dtype=np.float64)
+        W_total = float(np.sum(path_probs))
 
     # Compute probability-weighted centers
     mu_e = np.sum(path_probs[:, None] * embeddings_e, axis=0) / W_total
@@ -38,7 +43,11 @@ def initialize_single_component(
     mu_e_norm = np.linalg.norm(mu_e)
     if mu_e_norm > 1e-10:
         mu_e = mu_e / mu_e_norm
-    mu_a = np.sum(path_probs[:, None] * attributions_a, axis=0) / W_total
+
+    if metric_a == "l1":
+        mu_a = weighted_median(attributions_a, path_probs)
+    else:
+        mu_a = np.sum(path_probs[:, None] * attributions_a, axis=0) / W_total
 
     # All points assigned to component 1
     assignments = [1] * n_samples
@@ -62,6 +71,7 @@ def initialize_from_previous(
     path_probs: np.ndarray,
     prev_components: Dict[int, Dict],
     prev_assignments: List[int],
+    metric_a: str = "l2",
 ) -> Tuple[Dict[int, Dict], List[int]]:
     """Warm-start initialization from previous clustering solution.
 
@@ -83,7 +93,7 @@ def initialize_from_previous(
     # Validate previous assignments length
     if len(prev_assignments) != n_samples:
         # Fall back to single component if mismatch
-        return initialize_single_component(embeddings_e, attributions_a, path_probs)
+        return initialize_single_component(embeddings_e, attributions_a, path_probs, metric_a=metric_a)
 
     # Copy assignments
     assignments = prev_assignments.copy()
@@ -112,7 +122,10 @@ def initialize_from_previous(
         mu_e_norm = np.linalg.norm(mu_e)
         if mu_e_norm > 1e-10:
             mu_e = mu_e / mu_e_norm
-        mu_a = np.sum(P_c[:, None] * attributions_a[indices], axis=0) / W_c
+        if metric_a == "l1":
+            mu_a = weighted_median(attributions_a[indices], P_c)
+        else:
+            mu_a = np.sum(P_c[:, None] * attributions_a[indices], axis=0) / W_c
 
         components[c] = {
             'mu_e': mu_e,
@@ -123,7 +136,7 @@ def initialize_from_previous(
 
     # If no valid components, fall back to single component
     if not components:
-        return initialize_single_component(embeddings_e, attributions_a, path_probs)
+        return initialize_single_component(embeddings_e, attributions_a, path_probs, metric_a=metric_a)
 
     return components, assignments
 

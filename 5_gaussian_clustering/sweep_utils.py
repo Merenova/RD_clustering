@@ -158,7 +158,7 @@ def _run_single_config(args_tuple):
 
         # Initialize
         components, assignments = initialize_single_component(
-            embeddings_e, attributions_a, path_probs
+            embeddings_e, attributions_a, path_probs, metric_a=metric_a
         )
 
         next_component_id = max(components.keys()) + 1 if components else 2

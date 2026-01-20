@@ -183,6 +183,28 @@ def compute_weighted_mean_attribution(
     return weighted_sum / total_weight
 
 
+def compute_weighted_global_center(
+    attributions: np.ndarray,
+    path_probs: np.ndarray,
+    use_median: bool = True,
+) -> np.ndarray:
+    """Compute global H_0 consistent with distortion choice.
+
+    - use_median=True  -> probability-weighted coordinate-wise median (L1)
+    - use_median=False -> probability-weighted mean (L2)
+    """
+    W_total = float(path_probs.sum())
+    if W_total <= 0:
+        return np.zeros(attributions.shape[1])
+
+    if use_median:
+        # Reuse the same weighted-median implementation by treating the full set as one "cluster".
+        all_assignments = np.zeros(attributions.shape[0], dtype=np.int32)
+        return compute_weighted_median_attribution(attributions, all_assignments, path_probs, cluster_id=0)
+
+    return np.sum(path_probs[:, None] * attributions, axis=0) / W_total
+
+
 def load_rd_sweep_K_values(clustering_file: Path) -> Dict[str, int]:
     """Extract K values from RD sweep results for each (beta, gamma) config.
     
@@ -214,7 +236,8 @@ def load_prefix_data_for_baseline(
     attribution_graphs_dir: Path,
     samples_dir: Path,
     logger,
-    pooling: str = "mean"
+    pooling: str = "mean",
+    use_median_center: bool = True,
 ) -> Dict[str, Any]:
     """Load all data needed for K-means baseline.
     
@@ -278,12 +301,10 @@ def load_prefix_data_for_baseline(
     else:
         attributions = context_data["aggregated_attributions"].float().numpy()
     
-    # Compute H_0 (global weighted mean)
-    W_total = path_probs.sum()
-    if W_total > 0:
-        H_0 = np.sum(path_probs[:, None] * attributions, axis=0) / W_total
-    else:
-        H_0 = np.zeros(attributions.shape[1])
+    # Compute H_0 (shared attribution center) consistent with distortion choice.
+    # IMPORTANT: If you use L1-style centers (weighted median) for H_c, you should also
+    # center attributions by weighted median (not mean).
+    H_0 = compute_weighted_global_center(attributions, path_probs, use_median=use_median_center)
     
     # Center attributions (clustering operates on Delta_H)
     attributions_centered = attributions - H_0
@@ -522,13 +543,14 @@ def main():
             
             # Load data
             try:
-                prefix_data = load_prefix_data_for_baseline(
+                    prefix_data = load_prefix_data_for_baseline(
                     prefix_id,
                     args.embeddings_dir,
                     args.attribution_graphs_dir,
                     args.samples_dir,
                     logger,
-                    pooling=args.pooling
+                        pooling=args.pooling,
+                        use_median_center=not args.use_mean,
                 )
             except Exception as e:
                 logger.error(f"Error loading data for {prefix_id}: {e}")

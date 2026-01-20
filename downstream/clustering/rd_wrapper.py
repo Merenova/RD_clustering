@@ -22,6 +22,7 @@ sys.path.insert(0, str(CLUSTERING_MODULE_PATH))
 
 # Import the main clustering function
 from cluster import run_clustering
+from em_loop import weighted_median
 
 
 def run_rd_clustering(
@@ -125,7 +126,13 @@ def run_rd_clustering(
         if center_attributions:
             W_total = path_probs.sum()
             if W_total > 0:
-                H_0 = np.sum(path_probs[:, None] * attributions_a, axis=0) / W_total
+                # IMPORTANT: Center consistently with attribution distortion.
+                # - L1: weighted median
+                # - L2: weighted mean
+                if metric_a == "l1":
+                    H_0 = weighted_median(attributions_a, path_probs)
+                else:
+                    H_0 = np.sum(path_probs[:, None] * attributions_a, axis=0) / W_total
             else:
                 H_0 = np.zeros(attributions_a.shape[1])
             attributions_processed = attributions_a - H_0
@@ -179,6 +186,7 @@ def run_rd_clustering(
 
 def compute_global_normalization(
     attributions_list: List[np.ndarray],
+    metric_a: Optional[str] = None,
 ) -> Tuple[np.ndarray, float]:
     """Compute global H_0 and rms_norm across multiple attribution arrays.
     
@@ -191,11 +199,19 @@ def compute_global_normalization(
     Returns:
         Tuple of (global_H_0, global_rms_norm)
     """
+    if metric_a is None:
+        metric_a = CLUSTERING_CONFIG.get("metric_a", "l2")
+
     # Concatenate all attributions
     all_attrs = np.vstack([a for a in attributions_list if len(a) > 0])
     
-    # Compute global mean
-    global_H_0 = np.mean(all_attrs, axis=0)
+    # Compute global center
+    # - L1: coordinate-wise median (robust; minimizes sum abs under equal weights)
+    # - L2: mean (minimizes sum squared under equal weights)
+    if metric_a == "l1":
+        global_H_0 = weighted_median(all_attrs, np.ones(all_attrs.shape[0], dtype=np.float64))
+    else:
+        global_H_0 = np.mean(all_attrs, axis=0)
     
     # Center and compute RMS norm
     centered = all_attrs - global_H_0

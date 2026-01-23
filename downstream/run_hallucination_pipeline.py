@@ -269,6 +269,32 @@ def main():
     attributions_a_pooled = attributions_a  # Alias for clarity
     labels = np.array(all_labels, dtype=int)
     
+    # === Sparse reduction: keep only non-zero features ===
+    active_feature_indices = None
+    original_attr_dim = attributions_a.shape[1] if len(attributions_a) > 0 else 0
+    n_layers = None
+    d_transcoder = None
+    
+    if ATTRIBUTION_CONFIG.get("enable_sparse", True) and len(attributions_a) > 0 and attributions_a.shape[1] > 100000:
+        sparse_threshold = ATTRIBUTION_CONFIG.get("sparse_threshold", 1e-10)
+        
+        # Find features that are non-zero in ANY sample
+        nonzero_mask = np.any(np.abs(attributions_a) > sparse_threshold, axis=0)
+        active_feature_indices = np.where(nonzero_mask)[0]
+        
+        n_active = len(active_feature_indices)
+        logger.info(f"Sparse reduction: {n_active} / {original_attr_dim} features active "
+                    f"({100*n_active/original_attr_dim:.2f}%)")
+        
+        # Reduce to active features only
+        attributions_a = attributions_a[:, nonzero_mask]
+        attributions_a_pooled = attributions_a
+        
+        # Estimate model dimensions for later remapping
+        n_layers = 36  # Qwen3-8B
+        d_transcoder = original_attr_dim // n_layers
+    # === End sparse reduction ===
+    
     logger.info(f"Total samples for clustering: {len(embeddings_e)}")
     
     # Stage 6: Clustering

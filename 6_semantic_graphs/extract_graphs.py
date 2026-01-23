@@ -276,7 +276,9 @@ def main():
     logger.info(f"\nFound {len(clustering_files)} sweep results")
 
     # Filter based on Stage 5 manifest
-    results_dir = paths.results
+    # Derive results_dir from clustering_dir to respect --output-dir
+    # clustering_dir is typically {output_dir}/results/5_clustering/
+    results_dir = args.clustering_dir.parent
     all_prefix_ids = [f.stem.replace("_sweep_results", "") for f in clustering_files]
     available_ids, skipped_ids = filter_samples_by_manifest(
         all_prefix_ids, results_dir, "stage5", logger

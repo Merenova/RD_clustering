@@ -17,6 +17,7 @@ import sys
 import argparse
 import json
 import logging
+import multiprocessing
 import traceback
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -24,6 +25,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
+
+# Use 'spawn' start method for CUDA compatibility with multiprocessing
+_mp_context = multiprocessing.get_context('spawn')
 from tqdm import tqdm
 
 # Add circuit-tracer to path (relative to project root)
@@ -33,7 +37,7 @@ sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from utils.config import PathConfig
+# PathConfig removed - results_dir now derived from embeddings_dir
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger, get_log_path
 from utils.manifest import update_manifest_with_results
@@ -381,8 +385,7 @@ def run_clustering(
             Var_a,
             beta_e,
             beta_a,
-            K_max,
-            next_component_id,
+            next_component_id=next_component_id,
             metric_a=metric_a,
         )
 
@@ -535,7 +538,8 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             prefix_id=prefix_id,
             intermediate_dir=intermediate_dir,
             save_intermediate=args.save_intermediate,
-            normalize_dims=args.normalize_dims
+            normalize_dims=args.normalize_dims,
+            K_clamp=getattr(args, 'K_clamp', None)
         )
 
         # Save sweep results
@@ -580,7 +584,13 @@ def main():
     # R-D specific parameters
     parser.add_argument("--beta", type=float, default=2.0, help="Total β")
     parser.add_argument("--gamma", type=float, default=0.5, help="View ratio: β_e = γβ, β_a = (1-γ)β")
-    parser.add_argument("--K-max", type=int, default=20, help="Maximum number of components")
+    parser.add_argument("--K-max", type=int, default=20, 
+                        help="DEPRECATED: K_max no longer constrains clustering. "
+                             "Clustering converges naturally based on R-D criterion. "
+                             "This value is stored in sweep_config for downstream K_clamp filtering.")
+    parser.add_argument("--K-clamp", type=int, default=None,
+                        help="Maximum K for downstream steering (stored in sweep_config). "
+                             "If not provided, defaults to K_max value.")
     parser.add_argument("--max-iterations", type=int, default=50)
     parser.add_argument("--convergence-threshold", type=float, default=1e-6)
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for log files")
@@ -600,6 +610,8 @@ def main():
     parser.add_argument("--normalize-dims", action="store_true",
                         help="Normalize beta by dimensions: beta_e /= sqrt(d_e), beta_a /= d_a. "
                              "This accounts for L2 scaling as sqrt(d) and L1 scaling as d.")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip prefixes that already have *_sweep_results.json in output directory")
     args = parser.parse_args()
 
     # Load config if provided
@@ -615,6 +627,9 @@ def main():
         args.beta = clustering.get("beta", args.beta)
         args.gamma = clustering.get("gamma", args.gamma)
         args.K_max = clustering.get("K_max", args.K_max)
+        # Read K_clamp from config if not set via CLI
+        if args.K_clamp is None:
+            args.K_clamp = clustering.get("K_clamp", None)
         args.max_iterations = clustering.get("max_iterations", args.max_iterations)
         args.convergence_threshold = clustering.get("convergence_threshold", args.convergence_threshold)
         args.pooling = clustering.get("pooling", args.pooling)
@@ -662,6 +677,7 @@ def main():
     logger.info(f"Beta values: {sweeps_config.get('beta_values')}")
     logger.info(f"Gamma values: {sweeps_config.get('gamma_values')}")
     logger.info(f"K_max: {args.K_max}")
+    logger.info(f"K_clamp: {args.K_clamp}")
     logger.info(f"Attribution Metric: {args.attribution_metric}")
     logger.info(f"Dimension Normalization: {args.normalize_dims}")
     logger.info("Weighted Distortion: False")
@@ -672,8 +688,9 @@ def main():
     logger.info(f"\nFound {len(embedding_meta_files)} prefixes to process")
 
     # Filter based on Stage 4a manifest (embeddings extraction)
-    paths = PathConfig()
-    results_dir = paths.results
+    # Derive results_dir from embeddings_dir to respect --output-dir
+    # embeddings_dir is typically {output_dir}/results/4_feature_extraction/embeddings/
+    results_dir = args.embeddings_dir.parent.parent
     # all_prefix_ids = [f.stem.replace("_embeddings_meta", "") for f in embedding_meta_files]
     # available_ids, skipped_ids = filter_samples_by_manifest(
     #     all_prefix_ids, results_dir, "stage4a", logger
@@ -687,6 +704,21 @@ def main():
     skipped_ids = []
     logger.info("Skipping manifest check for design check...")
 
+    # Skip existing results if --skip-existing is set
+    if args.skip_existing:
+        original_count = len(embedding_meta_files)
+        filtered_files = []
+        for meta_file in embedding_meta_files:
+            prefix_id = meta_file.stem.replace("_embeddings_meta", "")
+            output_file = args.output_dir / f"{prefix_id}_sweep_results.json"
+            if output_file.exists():
+                skipped_ids.append(prefix_id)
+            else:
+                filtered_files.append(meta_file)
+        embedding_meta_files = filtered_files
+        logger.info(f"--skip-existing: Skipping {len(skipped_ids)} already completed prefixes")
+        logger.info(f"Remaining to process: {len(embedding_meta_files)} / {original_count}")
+
     # Process prefixes
     results = []
     completed_ids = []
@@ -694,9 +726,9 @@ def main():
     errors = {}
     
     if args.n_workers > 1:
-        # Parallel execution
+        # Parallel execution with 'spawn' context for CUDA compatibility
         logger.info(f"Starting parallel processing with {args.n_workers} workers...")
-        with ProcessPoolExecutor(max_workers=args.n_workers) as executor:
+        with ProcessPoolExecutor(max_workers=args.n_workers, mp_context=_mp_context) as executor:
             futures = {
                 executor.submit(
                     process_prefix,

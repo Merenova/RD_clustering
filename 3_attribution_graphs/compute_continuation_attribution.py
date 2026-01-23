@@ -325,7 +325,9 @@ def main():
     logger.info(f"Loaded branches index: {len(branches_index['output_files'])} prefixes")
 
     # Filter by Stage 2 manifest
-    results_dir = paths.results
+    # Derive results_dir from branches_dir to respect --output-dir
+    # branches_dir is typically {output_dir}/results/2_branch_sampling/
+    results_dir = args.branches_dir.parent
     all_prefix_ids = []
     branches_files = {}
 

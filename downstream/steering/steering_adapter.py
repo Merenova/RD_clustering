@@ -29,6 +29,7 @@ def expand_pooled_to_positions(
     n_layers: int,
     d_transcoder: int,
     top_B: int = 10,
+    active_feature_indices: np.ndarray = None,
 ) -> List[Tuple[int, int, int, float]]:
     """Expand pooled centroid to position-specific features.
     
@@ -39,11 +40,12 @@ def expand_pooled_to_positions(
     entries for ALL prefix positions [1, prefix_length).
     
     Args:
-        pooled_centroid: (n_layers * d_transcoder,) pooled attribution centroid
+        pooled_centroid: (n_layers * d_transcoder,) or (n_active,) pooled attribution centroid
         prefix_length: Number of tokens in prefix (including BOS)
         n_layers: Number of transformer layers
         d_transcoder: Transcoder dictionary size
         top_B: Number of top features to use for steering
+        active_feature_indices: If sparse storage used, maps reduced indices to original flat indices
         
     Returns:
         List of (layer, pos, feat_idx, h_c_val) tuples for steering
@@ -52,10 +54,16 @@ def expand_pooled_to_positions(
     top_indices = np.argsort(np.abs(pooled_centroid))[-top_B:]
     
     features = []
-    for flat_idx in top_indices:
-        layer = int(flat_idx // d_transcoder)
-        feat_idx = int(flat_idx % d_transcoder)
-        h_c_val = float(pooled_centroid[flat_idx])
+    for reduced_idx in top_indices:
+        # Remap to original flat index if using sparse representation
+        if active_feature_indices is not None:
+            flat_idx = int(active_feature_indices[reduced_idx])
+        else:
+            flat_idx = int(reduced_idx)
+        
+        layer = flat_idx // d_transcoder
+        feat_idx = flat_idx % d_transcoder
+        h_c_val = float(pooled_centroid[reduced_idx])
         
         # Skip near-zero features
         if abs(h_c_val) < 1e-8:
@@ -126,6 +134,7 @@ def prepare_steering_from_centroid(
     d_transcoder: int = None,
     top_B: int = None,
     pooled: bool = False,
+    active_feature_indices: np.ndarray = None,
 ) -> Tuple[List[Tuple], Dict, Dict]:
     """Convert attribution centroid to steering interventions.
     
@@ -138,6 +147,7 @@ def prepare_steering_from_centroid(
         d_transcoder: Transcoder size (for pooled)
         top_B: Number of top features to steer
         pooled: Whether centroid is position-pooled
+        active_feature_indices: For sparse storage, maps reduced indices to original
         
     Returns:
         Tuple of (features, encoder_cache, decoder_cache)
@@ -155,7 +165,8 @@ def prepare_steering_from_centroid(
             d_transcoder = model.cfg.d_mlp * 8
         
         features = expand_pooled_to_positions(
-            attr_centroid, prefix_length, n_layers, d_transcoder, top_B
+            attr_centroid, prefix_length, n_layers, d_transcoder, top_B,
+            active_feature_indices=active_feature_indices,
         )
     else:
         if prefix_context is None:
@@ -206,6 +217,7 @@ def generate_steered_outputs_real(
     top_B: int = None,
     max_new_tokens: int = 50,
     pooled: bool = False,
+    active_feature_indices: np.ndarray = None,
 ) -> List[Dict]:
     """Generate outputs with actual steering applied.
     
@@ -223,6 +235,7 @@ def generate_steered_outputs_real(
         top_B: Number of top features
         max_new_tokens: Max tokens to generate
         pooled: Whether centroid is pooled
+        active_feature_indices: For sparse storage, maps reduced indices to original
         
     Returns:
         List of output dicts with generated text
@@ -266,6 +279,7 @@ def generate_steered_outputs_real(
             d_transcoder=d_transcoder,
             top_B=top_B,
             pooled=pooled,
+            active_feature_indices=active_feature_indices,
         )
         
         if not features:

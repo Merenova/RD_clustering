@@ -74,6 +74,114 @@ def compute_continuation_log_prob_batched(
     return log_probs_list
 
 
+def compute_mean_target_logit_and_prob_batched(
+    logits: torch.Tensor,
+    batch_cont_info: List[Tuple[List[int], int]],
+) -> List[Tuple[float, float]]:
+    """Compute (mean target logit, mean target prob) for each continuation in a batch.
+
+    Teacher-forced: uses the provided target continuation tokens at their positions.
+
+    Args:
+        logits: Batched logits [batch_size, max_seq_len, vocab_size]
+        batch_cont_info: List of (continuation_token_ids, continuation_start) tuples
+
+    Returns:
+        List[(mean_target_logit, mean_target_prob)] one per batch item.
+    """
+    out: List[Tuple[float, float]] = []
+    seq_len = logits.shape[1]
+
+    for batch_idx, (cont_ids, cont_start) in enumerate(batch_cont_info):
+        if not cont_ids:
+            out.append((0.0, 0.0))
+            continue
+
+        valid_len = min(len(cont_ids), seq_len - cont_start)
+        if valid_len <= 0:
+            out.append((0.0, 0.0))
+            continue
+
+        positions = torch.arange(cont_start, cont_start + valid_len, device=logits.device)
+        cont_logits = logits[batch_idx, positions, :].float()  # [valid_len, vocab_size]
+        token_ids = torch.tensor(cont_ids[:valid_len], device=logits.device, dtype=torch.long)
+
+        target_logits = cont_logits[torch.arange(valid_len, device=logits.device), token_ids]  # [valid_len]
+        mean_target_logit = float(target_logits.mean().item())
+
+        log_probs = F.log_softmax(cont_logits, dim=-1)
+        target_logprobs = log_probs[torch.arange(valid_len, device=logits.device), token_ids]  # [valid_len]
+        mean_target_prob = float(torch.exp(target_logprobs).mean().item())
+
+        out.append((mean_target_logit, mean_target_prob))
+
+    return out
+
+
+def compute_delta_curve_metrics(
+    steered: Dict[int, Dict[float, List[float]]],
+    original: Dict[int, Dict[float, List[float]]],
+    epsilons: List[float],
+    metric_prefix: str,
+) -> Dict[str, Any]:
+    """Generic cluster-level metrics for a scalar signal per continuation (already token-averaged).
+
+    For each cluster, each epsilon:
+      - mean_*_original: mean over continuations
+      - mean_*_steered:  mean over continuations
+      - *_diff: steered - original
+
+    Also computes slope/corr/r2/spearman of *_diff vs epsilon per cluster.
+    """
+    cluster_ids = sorted(steered.keys())
+    per_cluster = {}
+
+    def _safe_slope(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or y.size < 2:
+            return 0.0
+        if float(np.std(x)) == 0.0:
+            return 0.0
+        # least-squares slope
+        return float(np.polyfit(x, y, 1)[0])
+
+    for c in cluster_ids:
+        mean_original = []
+        mean_steered = []
+        diffs = []
+
+        for eps in epsilons:
+            orig = original[c].get(eps, [])
+            st = steered[c].get(eps, [])
+            if not orig or not st:
+                m_orig = 0.0
+                m_st = 0.0
+            else:
+                m_orig = float(np.mean(orig))
+                m_st = float(np.mean(st))
+            mean_original.append(m_orig)
+            mean_steered.append(m_st)
+            diffs.append(m_st - m_orig)
+
+        X = np.asarray(epsilons, dtype=np.float64)
+        Y = np.asarray(diffs, dtype=np.float64)
+        corr, r2 = compute_correlation_and_r2(X, Y)
+        spearman = compute_spearman_correlation(X, Y)
+        slope = _safe_slope(X, Y)
+
+        per_cluster[c] = {
+            f"mean_{metric_prefix}_original": {eps: mean_original[i] for i, eps in enumerate(epsilons)},
+            f"mean_{metric_prefix}_steered": {eps: mean_steered[i] for i, eps in enumerate(epsilons)},
+            f"{metric_prefix}_diff": {eps: diffs[i] for i, eps in enumerate(epsilons)},
+            f"{metric_prefix}_slope": slope,
+            f"{metric_prefix}_r2": r2,
+            f"{metric_prefix}_corr": corr,
+            f"{metric_prefix}_spearman": spearman,
+            "n_samples": len(original[c].get(epsilons[0], [])) if epsilons else 0,
+        }
+
+    return {f"per_cluster_{metric_prefix}": per_cluster}
+
+
 def compute_h_c_norm(h_c_vals: List[float]) -> float:
     """Compute ||H_c|| norm from H_c values.
 
@@ -161,7 +269,23 @@ def compute_centered_logit_metrics(
             'n_samples': len(logits_orig) if logits_orig else 0
         }
 
-    return {'per_cluster_logit': per_cluster_logit_stats}
+    # Add alias: demeaned_logit == centered_logit (same quantity, different naming)
+    per_cluster_demeaned = {}
+    for c, stats in per_cluster_logit_stats.items():
+        per_cluster_demeaned[c] = {
+            'mean_demeaned_logit_original': stats['mean_centered_logit_original'],
+            'mean_demeaned_logit_steered': stats['mean_centered_logit_steered'],
+            'demeaned_logit_diff': stats['centered_logit_diff'],
+            'demeaned_logit_r2': stats['centered_logit_r2'],
+            'demeaned_logit_corr': stats['centered_logit_corr'],
+            'demeaned_logit_spearman': stats['centered_logit_spearman'],
+            'n_samples': stats.get('n_samples', 0),
+        }
+
+    return {
+        'per_cluster_logit': per_cluster_logit_stats,
+        'per_cluster_demeaned_logit': per_cluster_demeaned,
+    }
 
 
 def compute_cluster_mass_metrics(
@@ -302,6 +426,10 @@ def compute_steering_metrics(
     log_probs_original: Dict[int, Dict[float, List[float]]] = None,
     centered_logits_steered: Dict[int, Dict[float, List[float]]] = None,
     centered_logits_original: Dict[int, Dict[float, List[float]]] = None,
+    target_logits_steered: Dict[int, Dict[float, List[float]]] = None,
+    target_logits_original: Dict[int, Dict[float, List[float]]] = None,
+    target_probs_steered: Dict[int, Dict[float, List[float]]] = None,
+    target_probs_original: Dict[int, Dict[float, List[float]]] = None,
 ) -> Dict[str, Any]:
     """Compute all metrics for a sweep configuration.
 
@@ -433,6 +561,34 @@ def compute_steering_metrics(
         result['mean_logit_r2'] = float(np.mean(all_logit_r2)) if all_logit_r2 else 0.0
         result['mean_logit_corr'] = float(np.mean(all_logit_corr)) if all_logit_corr else 0.0
         result['mean_logit_spearman'] = float(np.mean(all_logit_spearman)) if all_logit_spearman else 0.0
+
+        # Also aggregate alias demeaned logit
+        all_demeaned_r2 = []
+        all_demeaned_corr = []
+        all_demeaned_spearman = []
+        for c, stats in logit_metrics.get('per_cluster_demeaned_logit', {}).items():
+            all_demeaned_r2.append(stats.get('demeaned_logit_r2', 0.0))
+            all_demeaned_corr.append(stats.get('demeaned_logit_corr', 0.0))
+            all_demeaned_spearman.append(stats.get('demeaned_logit_spearman', 0.0))
+            if c in result['per_cluster']:
+                result['per_cluster'][c]['demeaned_logit_r2'] = stats.get('demeaned_logit_r2', 0.0)
+                result['per_cluster'][c]['demeaned_logit_corr'] = stats.get('demeaned_logit_corr', 0.0)
+                result['per_cluster'][c]['demeaned_logit_spearman'] = stats.get('demeaned_logit_spearman', 0.0)
+        result['mean_demeaned_logit_r2'] = float(np.mean(all_demeaned_r2)) if all_demeaned_r2 else 0.0
+        result['mean_demeaned_logit_corr'] = float(np.mean(all_demeaned_corr)) if all_demeaned_corr else 0.0
+        result['mean_demeaned_logit_spearman'] = float(np.mean(all_demeaned_spearman)) if all_demeaned_spearman else 0.0
+
+    # Add cluster-level target logit/prob diffs and slope/corr vs epsilon (main scores)
+    if target_logits_steered is not None and target_logits_original is not None:
+        logit_curve = compute_delta_curve_metrics(
+            target_logits_steered, target_logits_original, epsilons, metric_prefix="target_logit"
+        )
+        result.update(logit_curve)
+    if target_probs_steered is not None and target_probs_original is not None:
+        prob_curve = compute_delta_curve_metrics(
+            target_probs_steered, target_probs_original, epsilons, metric_prefix="target_prob"
+        )
+        result.update(prob_curve)
 
     return result
 

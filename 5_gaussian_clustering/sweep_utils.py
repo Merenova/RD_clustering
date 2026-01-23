@@ -6,9 +6,13 @@ Provides functions for:
 - Finding Pareto-optimal configurations
 """
 
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
+
+# Use 'spawn' start method for CUDA compatibility with multiprocessing
+_mp_context = multiprocessing.get_context('spawn')
 
 import numpy as np
 from sklearn.metrics import silhouette_score
@@ -172,6 +176,7 @@ def _run_single_config(args_tuple):
             "H": [],
             "D_e": [],
             "D_a": [],
+            "assignments": [],  # Full assignments at each iteration
         }
 
         def serialize_components_snapshot(components_dict: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
@@ -258,7 +263,8 @@ def _run_single_config(args_tuple):
             components, assignments, next_component_id = apply_adaptive_control(
                 embeddings_e, attributions_a, path_probs,
                 assignments, components, P_bar, Var_e, Var_a,
-                beta_e, beta_a, K_max, next_component_id,
+                beta_e, beta_a,
+                next_component_id=next_component_id,
                 metric_a=metric_a,
             )
 
@@ -281,6 +287,7 @@ def _run_single_config(args_tuple):
             history["H"].append(float(rd_stats['H']))
             history["D_e"].append(float(rd_stats['D_e']))
             history["D_a"].append(float(rd_stats['D_a']))
+            history["assignments"].append([int(a) for a in assignments])
 
             if check_convergence(L_RD_prev, L_RD_curr, convergence_threshold):
                 break
@@ -346,14 +353,15 @@ def run_sweep_mode(
     prefix_id: Optional[str] = None,
     intermediate_dir: Optional[Path] = None,
     save_intermediate: bool = False,
-    normalize_dims: bool = False
+    normalize_dims: bool = False,
+    K_clamp: Optional[int] = None
 ) -> Dict:
     """Run sweep over (beta, gamma) grid with parallel processing.
 
     Args:
         data: Data dict with embeddings_e, attributions_a, path_probs
         sweeps_config: Sweep configuration with beta_values and gamma_values
-        K_max: Maximum number of components
+        K_max: DEPRECATED - kept for backward compat, no longer constrains clustering
         max_iterations: Maximum EM iterations
         convergence_threshold: Convergence threshold
         logger: Logger instance
@@ -363,6 +371,7 @@ def run_sweep_mode(
         intermediate_dir: Directory for intermediate results
         save_intermediate: Whether to save intermediate results
         normalize_dims: Whether to normalize beta by dimensions (beta_e /= sqrt(d_e), beta_a /= d_a)
+        K_clamp: Maximum K for downstream steering (stored in sweep_config)
 
     Returns:
         Dict with grid results
@@ -395,7 +404,8 @@ def run_sweep_mode(
     grid_results = []
 
     if n_workers > 1:
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        # Use 'spawn' context for CUDA compatibility
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=_mp_context) as executor:
             futures = {executor.submit(_run_single_config, task): task for task in tasks}
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Sweep configs", disable=logger.getEffectiveLevel() > 20):
@@ -428,6 +438,8 @@ def run_sweep_mode(
     H_0 = data.get("H_0")
     d_e = data["embeddings_e"].shape[1]
     d_a = data["attributions_a"].shape[1]
+    # K_clamp defaults to K_max if not provided (backward compat)
+    effective_K_clamp = K_clamp if K_clamp is not None else K_max
     sweep_results = {
         "prefix_id": data["prefix_id"],
         "prefix": data.get("prefix"),
@@ -435,7 +447,8 @@ def run_sweep_mode(
         "sweep_config": {
             "beta_values": beta_values,
             "gamma_values": gamma_values,
-            "K_max": K_max,
+            "K_max": K_max,  # DEPRECATED: kept for backward compat
+            "K_clamp": effective_K_clamp,  # For downstream steering filtering
             "metric_a": metric_a,
             "normalize_dims": normalize_dims,
             "d_e": d_e,

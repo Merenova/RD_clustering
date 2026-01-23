@@ -205,17 +205,22 @@ def compute_weighted_global_center(
     return np.sum(path_probs[:, None] * attributions, axis=0) / W_total
 
 
-def load_rd_sweep_K_values(clustering_file: Path) -> Dict[str, int]:
-    """Extract K values from RD sweep results for each (beta, gamma) config.
+def load_rd_sweep_K_values(clustering_file: Path) -> Tuple[Dict[str, int], int]:
+    """Extract K values (and K_clamp) from RD sweep results for each (beta, gamma) config.
     
     Args:
         clustering_file: Path to {prefix}_sweep_results.json
         
     Returns:
-        Dict mapping "beta{b}_gamma{g}" -> K
+        (K_map, K_clamp)
+        - K_map: Dict mapping "beta{b}_gamma{g}" -> K
+        - K_clamp: K_clamp from sweep_config (falls back to K_max for backward compat)
     """
     data = load_json(clustering_file)
     grid = data.get("grid", [])
+    sweep_config = data.get("sweep_config", {}) or {}
+    # Priority: K_clamp > K_max > default 20
+    K_clamp = int(sweep_config.get("K_clamp", sweep_config.get("K_max", 20)))
     
     K_map = {}
     for entry in grid:
@@ -227,7 +232,7 @@ def load_rd_sweep_K_values(clustering_file: Path) -> Dict[str, int]:
             key = f"beta{beta}_gamma{gamma}"
             K_map[key] = K
     
-    return K_map
+    return K_map, K_clamp
 
 
 def load_prefix_data_for_baseline(
@@ -427,6 +432,8 @@ def main():
                         help="Number of prefixes to batch together")
     parser.add_argument("--log-dir", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--K-clamp", type=int, default=None,
+                        help="Maximum K for downstream steering (filters out K > K_clamp)")
     args = parser.parse_args()
     
     # Setup logging
@@ -466,6 +473,9 @@ def main():
             args.cross_prefix_batching = steering_config.get("cross_prefix_batching", False)
         if args.prefix_batch_size is None or args.prefix_batch_size <= 0:
             args.prefix_batch_size = steering_config.get("prefix_batch_size", 16)
+        # K_clamp from config if not provided via CLI
+        if args.K_clamp is None:
+            args.K_clamp = steering_config.get("K_clamp", None)
     
     if not sweeps:
         # Default sweep
@@ -562,15 +572,30 @@ def main():
             )
             n_features = len(selected_features)
             
-            # Load RD sweep K values
-            K_map = load_rd_sweep_K_values(clustering_file)
-            rd_sweep_data = load_json(clustering_file)
-            H_0_rd = rd_sweep_data.get("H_0")
-            H_0 = np.array(H_0_rd) if H_0_rd is not None else prefix_data["H_0"]
+            # Load RD sweep K values (baseline uses RD only to choose K and optionally filter by K_clamp)
+            K_map, K_clamp_from_sweep = load_rd_sweep_K_values(clustering_file)
+            
+            # Use K_clamp if provided via CLI, otherwise use sweep_config K_clamp
+            effective_K_clamp = args.K_clamp if args.K_clamp is not None else K_clamp_from_sweep
+
+            # IMPORTANT: Do NOT reuse RD clustering's H_0 here.
+            # Baseline centers using its own L1-consistent H_0 (weighted median) from attributions + path_probs.
+            H_0 = prefix_data["H_0"]
             
             # Compute baseline log_P
             logger.info(f"  {prefix_id}: Computing baseline log_P...")
-            first_K = list(K_map.values())[0] if K_map else 5
+            # Pick a valid K for the baseline warm-start; skip prefixes with only invalid Ks
+            valid_Ks = [k for k in K_map.values() if k is not None and k > 1 and k <= effective_K_clamp]
+            if not valid_Ks:
+                if not K_map:
+                    # Fallback when sweep data is missing: use min(5, K_clamp) to respect K_clamp
+                    fallback_K = min(5, effective_K_clamp) if effective_K_clamp > 1 else 2
+                    valid_Ks = [fallback_K]
+                    logger.warning(f"  {prefix_id}: No sweep data, using fallback K={fallback_K}")
+                else:
+                    logger.warning(f"  {prefix_id}: No valid K (need 1 < K <= K_clamp={effective_K_clamp}); skipping baseline")
+                    continue
+            first_K = valid_Ks[0]
             temp_assignments = run_kmeans_clustering(prefix_data["embeddings"], first_K)[0]
             baseline_branches = utils.build_branches_from_data(
                 prefix_data["branches_data"], temp_assignments.tolist()
@@ -598,7 +623,7 @@ def main():
                 "selected_features": selected_features,
                 "n_features": n_features,
                 "K_map": K_map,
-                "rd_sweep_data": rd_sweep_data,
+                "K_clamp": effective_K_clamp,
                 "H_0": H_0,
                 "baseline_metadata": baseline_metadata,
                 "prefix_results": prefix_results,
@@ -622,11 +647,9 @@ def main():
                     continue
                     
                 K = K_map[clustering_key]
-                rd_sweep_data = state["rd_sweep_data"]
-                sweep_config = rd_sweep_data.get("sweep_config", {})
-                K_max = sweep_config.get("K_max", 20)
+                K_clamp = int(state.get("K_clamp", 20))
                 
-                if K == 1 or K == K_max:
+                if K == 1 or K > K_clamp:
                     continue
                 
                 prefix_data = state["prefix_data"]

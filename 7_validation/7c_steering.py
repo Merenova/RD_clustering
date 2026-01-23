@@ -902,9 +902,22 @@ def compute_branch_log_probs_batch(
                 selected_log_probs = log_probs[torch.arange(valid_len, device=logits.device), token_ids_tensor]
                 per_token_log_probs = selected_log_probs.tolist()
                 log_P_original = float(selected_log_probs.sum().item())
+
+                # Target logits/probs (teacher-forced), aggregated over continuation tokens
+                target_logits = cont_logits[torch.arange(valid_len, device=logits.device), token_ids_tensor]  # [valid_len]
+                per_token_target_logits = target_logits.tolist()
+                mean_target_logit = float(target_logits.mean().item())
+
+                target_probs = torch.exp(selected_log_probs)  # [valid_len]
+                per_token_target_probs = target_probs.tolist()
+                mean_target_prob = float(target_probs.mean().item())
             else:
                 per_token_log_probs = []
                 log_P_original = 0.0
+                per_token_target_logits = []
+                mean_target_logit = 0.0
+                per_token_target_probs = []
+                mean_target_prob = 0.0
 
             # 2. Centered logits (already computed)
             per_token_centered_logits, mean_centered_logit = centered_logits_batch[j]
@@ -914,6 +927,10 @@ def compute_branch_log_probs_batch(
                 "per_token_log_probs_original": per_token_log_probs,
                 "per_token_centered_logits_original": per_token_centered_logits,
                 "mean_centered_logit_original": mean_centered_logit,
+                "per_token_target_logits_original": per_token_target_logits,
+                "mean_target_logit_original": mean_target_logit,
+                "per_token_target_probs_original": per_token_target_probs,
+                "mean_target_prob_original": mean_target_prob,
             }
 
         if progress is not None:
@@ -958,6 +975,10 @@ def compute_baseline_metadata(
             "per_token_log_probs_original": branch_log_probs[branch_id].get("per_token_log_probs_original", []),
             "per_token_centered_logits_original": branch_log_probs[branch_id].get("per_token_centered_logits_original", []),
             "mean_centered_logit_original": branch_log_probs[branch_id].get("mean_centered_logit_original", 0.0),
+            "per_token_target_logits_original": branch_log_probs[branch_id].get("per_token_target_logits_original", []),
+            "mean_target_logit_original": branch_log_probs[branch_id].get("mean_target_logit_original", 0.0),
+            "per_token_target_probs_original": branch_log_probs[branch_id].get("per_token_target_probs_original", []),
+            "mean_target_prob_original": branch_log_probs[branch_id].get("mean_target_prob_original", 0.0),
         }
 
     return metadata

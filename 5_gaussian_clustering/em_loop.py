@@ -110,10 +110,11 @@ def rd_e_step(
     # Rate costs: (K,)
     rate_costs = np.array([-np.log(P_bar.get(c, eps) + eps) for c in component_ids], dtype=np.float32)
 
-    # Try GPU acceleration for large datasets (lowered threshold from 10000 to 1000)
+    # Try GPU acceleration for datasets
     # GPU path supports both L2 and L1 metrics
+    # Threshold lowered to 50 - with large GPUs, transfer overhead is negligible
     backend = None
-    if use_gpu and GPU_AVAILABLE and n_samples >= 1000:
+    if use_gpu and GPU_AVAILABLE and n_samples >= 50:
         backend = get_compute_backend(use_gpu=True, n_samples=n_samples)
 
     if backend is not None and hasattr(backend, 'name') and backend.name == "torch":

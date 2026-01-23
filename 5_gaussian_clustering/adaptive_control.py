@@ -10,7 +10,7 @@ Key criteria (from Theorems 3.1 and 3.2):
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from rd_objective import (
     compute_component_masses,
@@ -176,7 +176,7 @@ def split_operation(
     Var_a: Dict[int, float],
     beta_e: float,
     beta_a: float,
-    K_max: int,
+    K_max: int,  # DEPRECATED: kept for backward compat, ignored
     next_component_id: int,
     W_total: float,
     metric_a: str = "l2",
@@ -189,6 +189,9 @@ def split_operation(
         β_e·ΔD^(e,red) + β_a·ΔD^(a,red) > P̄_c·H_binary(α)
 
     Uses combined distance for 2-means: β_e·Dist(e) + β_a·Dist(a)
+    
+    NOTE: K_max constraint has been removed. Clustering now converges naturally
+    based on the R-D criterion. Use K_clamp downstream for steering if needed.
 
     Args:
         embeddings_e: Semantic embeddings (N, d_e)
@@ -201,7 +204,7 @@ def split_operation(
         Var_a: Attribution variance per component {c: Var_c^(a)}
         beta_e: Semantic distortion weight
         beta_a: Attribution distortion weight
-        K_max: Maximum number of components
+        K_max: DEPRECATED - kept for backward compatibility, ignored
         next_component_id: Next available component ID
         W_total: Total probability mass
         metric_a: Attribution distance metric ("l2" or "l1")
@@ -218,15 +221,14 @@ def split_operation(
     new_assignments_arr = assignments_arr.copy()
 
     # Sort by total variance (highest first) to prioritize splitting high-variance components
+    # NOTE: K_max constraint removed - clustering converges naturally based on R-D criterion
     to_split = [(c, beta_e * Var_e.get(c, 0) + beta_a * Var_a.get(c, 0))
-                for c in components.keys() if len(new_components) < K_max]
+                for c in components.keys()]
     to_split.sort(key=lambda x: x[1], reverse=True)
 
     splits_done = 0
     for c, _ in to_split:
         if splits_done >= max_splits:
-            break
-        if len(new_components) >= K_max:
             break
 
         if c not in new_components:
@@ -594,8 +596,8 @@ def apply_adaptive_control(
     Var_a: Dict[int, float],
     beta_e: float,
     beta_a: float,
-    K_max: int,
-    next_component_id: int,
+    K_max: Optional[int] = None,  # DEPRECATED: kept for backward compat, ignored
+    next_component_id: int = 2,
     metric_a: str = "l2",
     max_splits_per_iter: int = 1,
     max_junks_per_iter: int = 1,
@@ -604,6 +606,9 @@ def apply_adaptive_control(
 
     Order: Split → Junk
     (No Clone - it's a special case of Split)
+    
+    NOTE: K_max constraint has been removed. Clustering converges naturally
+    based on R-D criterion. Use K_clamp downstream for steering if needed.
 
     Args:
         embeddings_e: Semantic embeddings
@@ -616,7 +621,7 @@ def apply_adaptive_control(
         Var_a: Attribution variance per component
         beta_e: Semantic distortion weight
         beta_a: Attribution distortion weight
-        K_max: Maximum components
+        K_max: DEPRECATED - kept for backward compatibility, ignored
         next_component_id: Next available component ID
         metric_a: Metric for attribution
         max_splits_per_iter: Maximum number of splits per iteration (default 1)

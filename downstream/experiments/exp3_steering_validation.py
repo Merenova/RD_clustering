@@ -46,6 +46,7 @@ def run_experiment_3(
     embedding_model=None,
     output_dir: Path = None,
     logger=None,
+    active_feature_indices: np.ndarray = None,
 ) -> Dict[str, Any]:
     """Run Experiment 3: Steering Validation.
     
@@ -74,6 +75,7 @@ def run_experiment_3(
         embedding_model: Semantic embedding model (for similarity computation)
         output_dir: Output directory
         logger: Logger instance
+        active_feature_indices: For sparse storage, maps reduced indices to original
         
     Returns:
         Dict with experiment results
@@ -157,6 +159,7 @@ def run_experiment_3(
                 n_layers=n_layers,
                 d_transcoder=d_transcoder,
                 prefix_context=prefix_context,
+                active_feature_indices=active_feature_indices,
             )
             
             # Compute similarity to cluster
@@ -291,6 +294,7 @@ def generate_steered_outputs(
     n_layers: int = None,
     d_transcoder: int = None,
     prefix_context=None,
+    active_feature_indices: np.ndarray = None,
 ) -> List[Dict]:
     """Generate outputs with steering applied.
     
@@ -310,6 +314,7 @@ def generate_steered_outputs(
         n_layers: Number of layers (for pooled)
         d_transcoder: Transcoder size (for pooled)
         prefix_context: PrefixAttributionContext (for non-pooled)
+        active_feature_indices: For sparse storage, maps reduced indices to original
         
     Returns:
         List of output dicts with generated text
@@ -332,6 +337,7 @@ def generate_steered_outputs(
                 steering_method=steering_method,
                 top_B=top_B,
                 pooled=pooled,
+                active_feature_indices=active_feature_indices,
             )
         except Exception as e:
             # Fall back to placeholder on error

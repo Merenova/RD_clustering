@@ -82,6 +82,9 @@ ATTRIBUTION_CONFIG = {
     # Position pooling for cross-prefix clustering (Exp4, Exp5)
     "compute_pooled": True,
     "pooling_method": "mean",  # "sum", "mean", or "max"
+    # Sparse storage: keep only non-zero features to reduce 170GB -> ~1GB
+    "enable_sparse": True,
+    "sparse_threshold": 1e-10,  # Features with |value| <= threshold considered zero
 }
 
 # =============================================================================

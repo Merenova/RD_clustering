@@ -327,7 +327,9 @@ def main():
         return
 
     # Filter branch files based on Stage 3 manifest
-    results_dir = paths.results
+    # Derive results_dir from samples_dir to respect --output-dir
+    # samples_dir is typically {output_dir}/results/2_branch_sampling/
+    results_dir = args.samples_dir.parent
     all_prefix_ids = [f.stem.replace("_branches", "") for f in branch_files]
     available_ids, skipped_ids = filter_samples_by_manifest(
         all_prefix_ids, results_dir, "stage3", logger

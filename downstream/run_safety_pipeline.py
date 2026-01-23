@@ -251,6 +251,43 @@ def main():
             base_attributions_pooled = np.stack([d["attribution_pooled"] for d in base_valid])
             base_attributions = base_attributions_pooled  # Use pooled for all cross-prefix experiments
             
+            # === Sparse reduction: keep only non-zero features ===
+            # This reduces storage from ~170GB to ~1GB and makes clustering feasible
+            active_feature_indices = None
+            original_attr_dim = instruct_attributions_pooled.shape[1]
+            n_layers = None
+            d_transcoder = None
+            
+            if ATTRIBUTION_CONFIG.get("enable_sparse", True):
+                sparse_threshold = ATTRIBUTION_CONFIG.get("sparse_threshold", 1e-10)
+                
+                # Find features that are non-zero in ANY sample (across both models)
+                all_pooled = np.vstack([instruct_attributions_pooled, base_attributions_pooled])
+                nonzero_mask = np.any(np.abs(all_pooled) > sparse_threshold, axis=0)
+                active_feature_indices = np.where(nonzero_mask)[0]
+                
+                n_active = len(active_feature_indices)
+                logger.info(f"Sparse reduction: {n_active} / {original_attr_dim} features active "
+                            f"({100*n_active/original_attr_dim:.2f}%)")
+                
+                # Reduce to active features only
+                instruct_attributions_pooled = instruct_attributions_pooled[:, nonzero_mask]
+                instruct_attributions = instruct_attributions_pooled
+                base_attributions_pooled = base_attributions_pooled[:, nonzero_mask]
+                base_attributions = base_attributions_pooled
+                
+                # Get model dimensions for later remapping (layer, feat_idx)
+                # d_transcoder = d_mlp * 8, original_dim = n_layers * d_transcoder
+                # We'll estimate from the first sample's metadata if available
+                if instruct_valid and instruct_valid[0].get("n_layers"):
+                    n_layers = instruct_valid[0]["n_layers"]
+                    d_transcoder = original_attr_dim // n_layers
+                else:
+                    # Fallback: assume 36 layers (Qwen3-8B)
+                    n_layers = 36
+                    d_transcoder = original_attr_dim // n_layers
+            # === End sparse reduction ===
+            
             # Update data lists to only include valid samples (remove numpy arrays for JSON)
             instruct_data = [{k: v for k, v in d.items() if k not in ("embedding", "attribution", "attribution_pooled")} for d in instruct_valid]
             base_data = [{k: v for k, v in d.items() if k not in ("embedding", "attribution", "attribution_pooled")} for d in base_valid]
@@ -259,16 +296,27 @@ def main():
             save_json(instruct_data, instruct_meta_file)
             save_json(base_data, base_meta_file)
             
-            np.savez(
-                embed_file,
-                instruct_embeddings=instruct_embeddings,
+            # Build save dict with sparse metadata
+            save_dict = {
+                "instruct_embeddings": instruct_embeddings,
                 # For cross-prefix: both are pooled (position-specific can't be stacked across prefixes)
-                instruct_attributions=instruct_attributions_pooled,
-                instruct_attributions_pooled=instruct_attributions_pooled,
-                base_embeddings=base_embeddings,
-                base_attributions=base_attributions_pooled,
-                base_attributions_pooled=base_attributions_pooled,
-            )
+                "instruct_attributions": instruct_attributions_pooled,
+                "instruct_attributions_pooled": instruct_attributions_pooled,
+                "base_embeddings": base_embeddings,
+                "base_attributions": base_attributions_pooled,
+                "base_attributions_pooled": base_attributions_pooled,
+            }
+            
+            # Add sparse metadata for steering remapping
+            if active_feature_indices is not None:
+                save_dict["active_feature_indices"] = active_feature_indices
+                save_dict["original_attr_dim"] = np.array([original_attr_dim])
+                if n_layers is not None:
+                    save_dict["n_layers"] = np.array([n_layers])
+                if d_transcoder is not None:
+                    save_dict["d_transcoder"] = np.array([d_transcoder])
+            
+            np.savez(embed_file, **save_dict)
             logger.info(f"Saved embeddings to {embed_file}")
             logger.info(f"  Instruct samples: {len(instruct_embeddings)}")
             logger.info(f"  Base samples: {len(base_embeddings)}")
@@ -292,6 +340,11 @@ def main():
             "base_attributions_pooled",
             emb_data["base_attributions"]
         )
+        # Load sparse metadata for steering remapping (if present)
+        active_feature_indices = emb_data.get("active_feature_indices", None)
+        original_attr_dim = emb_data["original_attr_dim"][0] if "original_attr_dim" in emb_data else None
+        n_layers = emb_data["n_layers"][0] if "n_layers" in emb_data else None
+        d_transcoder = emb_data["d_transcoder"][0] if "d_transcoder" in emb_data else None
         # Load filtered sample metadata for labels
         instruct_data = load_json(instruct_meta_file)
         base_data = load_json(base_meta_file)

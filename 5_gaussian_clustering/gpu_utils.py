@@ -212,7 +212,7 @@ class TorchBackend:
 def get_compute_backend(
     use_gpu: bool = True,
     n_samples: int = 0,
-    min_samples_for_gpu: int = 10000,
+    min_samples_for_gpu: int = 50,  # Lowered - large GPUs have negligible transfer overhead
     device: str = 'cuda',
 ) -> 'NumPyBackend | TorchBackend':
     """Get the appropriate compute backend.
@@ -220,7 +220,7 @@ def get_compute_backend(
     Args:
         use_gpu: Whether to prefer GPU if available
         n_samples: Number of samples (for deciding if GPU is worth the overhead)
-        min_samples_for_gpu: Minimum samples to use GPU (transfer overhead)
+        min_samples_for_gpu: Minimum samples to use GPU (default 50)
         device: CUDA device string
 
     Returns:

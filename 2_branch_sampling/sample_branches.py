@@ -123,16 +123,22 @@ def compute_temp1_logprobs(
     continuations: List[Continuation],
     logger,
     batch_size: int,
+    skip_rescore: bool = False,
 ) -> None:
     """Rescore continuations with temperature=1.0 using prompt logprobs."""
     if not continuations:
+        return
+
+    # Skip rescoring if requested (saves significant time with newer vLLM)
+    if skip_rescore:
+        logger.info("Skipping temp=1.0 rescoring (--skip-rescore flag)")
         return
 
     try:
         scoring_params = SamplingParams(
             temperature=1.0,
             top_p=1.0,
-            max_tokens=0,
+            max_tokens=1,  # vLLM requires at least 1; we only use prompt_logprobs
             prompt_logprobs=1,
         )
     except TypeError:
@@ -169,9 +175,14 @@ def compute_temp1_logprobs(
 
             logprob_sum = 0.0
             n_tokens = 0
-            max_idx = min(len(full_ids), len(prompt_logprobs))
+            # prompt_logprobs[i] corresponds to full_ids[i+1] (first entry for BOS is excluded)
+            # So for full_ids[idx], look at prompt_logprobs[idx - 1]
+            max_idx = min(len(full_ids), len(prompt_logprobs) + 1)
             for idx in range(start_idx, max_idx):
-                lp = extract_logprob_for_token(prompt_logprobs[idx], full_ids[idx])
+                logprob_idx = idx - 1
+                if logprob_idx < 0 or logprob_idx >= len(prompt_logprobs):
+                    continue
+                lp = extract_logprob_for_token(prompt_logprobs[logprob_idx], full_ids[idx])
                 if lp is None:
                     continue
                 logprob_sum += lp
@@ -217,6 +228,9 @@ def sample_continuations_natural(
     """
     all_samples: List[Dict[str, Any]] = []
     total_samples = 0
+    batches_without_new = 0
+    max_batches_without_new = 5  # Early stop if no new distinct in 5 batches
+    prev_distinct_count = 0
 
     # Setup sampling parameters
     sampling_params = SamplingParams(
@@ -260,13 +274,24 @@ def sample_continuations_natural(
 
         # Deduplicate and check if we have enough distinct continuations
         continuations = deduplicate_continuations(all_samples)
+        current_distinct = len(continuations)
 
         # Check stopping condition: enough distinct continuations
-        if max_total_continuations is not None and len(continuations) >= max_total_continuations:
+        if max_total_continuations is not None and current_distinct >= max_total_continuations:
             # Truncate to exactly max_total_continuations (keep top by probability)
             continuations = continuations[:max_total_continuations]
             logger.info(f"  Reached target: {len(continuations)} distinct continuations")
             return continuations, total_samples
+
+        # Early stopping: if no new distinct sequences found for several batches, stop
+        if current_distinct == prev_distinct_count:
+            batches_without_new += 1
+            if batches_without_new >= max_batches_without_new:
+                logger.info(f"  Early stop: no new distinct in {max_batches_without_new} batches. Total: {current_distinct} distinct")
+                return continuations, total_samples
+        else:
+            batches_without_new = 0
+        prev_distinct_count = current_distinct
 
     # Return what we have even if we didn't reach the target count
     continuations = deduplicate_continuations(all_samples)
@@ -313,8 +338,9 @@ def process_prefix(
     max_total_continuations: int,
     max_batches: int,
     output_dir: Path,
-    logger
-) -> Path:
+    logger,
+    skip_rescore: bool = False,
+) -> Tuple[Path, int]:
     """Process a single prefix: sample continuations from the prefix.
 
     Args:
@@ -327,9 +353,10 @@ def process_prefix(
         max_batches: Max batches for sampling
         output_dir: Output directory
         logger: Logger instance
+        skip_rescore: Skip temperature=1.0 rescoring for speed
 
     Returns:
-        Path to saved output file
+        Tuple of (Path to saved output file, number of continuations found)
     """
     logger.info(f"Processing prefix: {prefix_id}")
     logger.info(f"Prefix text: {prefix[:100]}...")
@@ -348,7 +375,7 @@ def process_prefix(
     
     logger.info(f"Sampled {len(continuations)} natural continuations")
 
-    if sampling_config.temperature != 1.0:
+    if sampling_config.temperature != 1.0 and not skip_rescore:
         logger.info("Rescoring continuations at temperature=1.0 for logprob stability...")
         compute_temp1_logprobs(
             llm=llm,
@@ -357,6 +384,7 @@ def process_prefix(
             continuations=continuations,
             logger=logger,
             batch_size=sampling_config.batch_size,
+            skip_rescore=skip_rescore,
         )
     
     # Step 3: Construct Output Format
@@ -382,7 +410,7 @@ def process_prefix(
     logger.info(f"Statistics for {prefix_id}:")
     logger.info(f"  Total continuations: {total_continuations_so_far} (max: {max_total_continuations})")
 
-    return output_file
+    return output_file, total_continuations_so_far
 
 
 def main():
@@ -470,6 +498,17 @@ def main():
         "--quiet",
         action="store_true",
         help="Quiet mode (only progress bars)"
+    )
+    parser.add_argument(
+        "--skip-rescore",
+        action="store_true",
+        help="Skip temperature=1.0 rescoring (faster, uses original sampling logprobs)"
+    )
+    parser.add_argument(
+        "--max-complete",
+        type=int,
+        default=None,
+        help="Stop after this many prefixes reach max_total_continuations (None = process all)"
     )
     args = parser.parse_args()
 
@@ -560,8 +599,9 @@ def main():
     output_files = []
     completed_ids = []
     failed_ids = []
-    filtered_ids = []  # Reserved for future filtering logic
+    filtered_ids = []  # Prefixes filtered due to SkipPrefixError
     errors = {}
+    
     for idx, cloze in enumerate(tqdm(clozes, desc="Processing prefixes")):
         prefix_id = cloze.get("id") or cloze.get("cloze_id") or f"cloze_{idx:03d}"
 
@@ -573,14 +613,26 @@ def main():
 
         # Process prefix
         try:
-            output_file = process_prefix(
+            output_file, n_continuations = process_prefix(
                 prefix, prefix_id, llm, tokenizer,
                 sampling_config, args.max_total_continuations,
                 args.max_batches,
-                args.output_dir, logger
+                args.output_dir, logger,
+                skip_rescore=args.skip_rescore,
             )
             output_files.append(str(output_file))
-            completed_ids.append(prefix_id)
+            
+            # Check if we reached the target - treat as failed if not
+            if n_continuations < args.max_total_continuations:
+                logger.warning(f"Low diversity: {prefix_id} has only {n_continuations}/{args.max_total_continuations} continuations")
+                failed_ids.append(prefix_id)
+                errors[prefix_id] = f"Low diversity: only {n_continuations}/{args.max_total_continuations} continuations found"
+            else:
+                completed_ids.append(prefix_id)
+                # Check if we've reached the max-complete target
+                if args.max_complete and len(completed_ids) >= args.max_complete:
+                    logger.info(f"Reached --max-complete target: {len(completed_ids)} complete prefixes")
+                    break
         except SkipPrefixError as e:
         # Filtered out due to sample constraints
             logger.info(f"Skipping {prefix_id}: {str(e)}")
@@ -612,6 +664,8 @@ def main():
     index_file = args.output_dir / "branches_index.json"
     save_json(index_data, index_file)
 
+    # Combine skipped (from previous stage) and filtered (low diversity) for manifest
+    # Both should be excluded from downstream processing
     all_skipped_ids = skipped_ids + filtered_ids
     update_manifest_with_results(
         results_dir=results_dir,
@@ -626,8 +680,11 @@ def main():
     logger.info("=" * 60)
     logger.info("COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Processed {len(completed_ids)}/{len(clozes)} prefixes")
-    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}, Skipped (stage1): {len(skipped_ids)}, Filtered: {len(filtered_ids)}")
+    logger.info(f"Processed {len(completed_ids)}/{len(clozes)} prefixes successfully")
+    logger.info(f"  Completed: {len(completed_ids)} (reached {args.max_total_continuations} continuations)")
+    logger.info(f"  Failed: {len(failed_ids)} (low diversity or error)")
+    logger.info(f"  Filtered: {len(filtered_ids)}")
+    logger.info(f"  Skipped (stage1): {len(skipped_ids)}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Index file: {index_file}")
 

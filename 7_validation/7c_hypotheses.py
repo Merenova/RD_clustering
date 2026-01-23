@@ -748,6 +748,10 @@ def run_steering_sweep(
     log_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     centered_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     centered_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     detailed_logs = [] if log_details else None
 
     effective_batch_size = max_batch_size if max_batch_size > 0 else 128
@@ -783,6 +787,8 @@ def run_steering_sweep(
                     "cont_start": cont_start,
                     "baseline": meta["log_P_original"],
                     "baseline_mean_centered_logit": meta.get("mean_centered_logit_original", 0.0),
+                    "baseline_mean_target_logit": meta.get("mean_target_logit_original", 0.0),
+                    "baseline_mean_target_prob": meta.get("mean_target_prob_original", 0.0),
                     "features": features,
                     "decoder_cache": c_decoder_cache,
                 })
@@ -811,6 +817,8 @@ def run_steering_sweep(
 
                 # Compute centered logits for steered pass
                 chunk_centered_logits = steering.compute_per_token_centered_logits_batched(logits, chunk_cont_info)
+                # Compute mean target logits/probs for steered pass
+                chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
                 for idx, (item, log_P) in enumerate(zip(chunk_items, chunk_log_probs)):
                     delta = log_P - item["baseline"]
@@ -828,6 +836,13 @@ def run_steering_sweep(
                     _, mean_centered_logit_steered = chunk_centered_logits[idx]
                     centered_logits_steered[c_id][eps].append(mean_centered_logit_steered)
                     centered_logits_original[c_id][eps].append(item["baseline_mean_centered_logit"])
+
+                    # Track mean target logits/probs
+                    mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[idx]
+                    target_logits_steered[c_id][eps].append(mean_target_logit_steered)
+                    target_logits_original[c_id][eps].append(item.get("baseline_mean_target_logit", 0.0))
+                    target_probs_steered[c_id][eps].append(mean_target_prob_steered)
+                    target_probs_original[c_id][eps].append(item.get("baseline_mean_target_prob", 0.0))
 
                     if log_details:
                         per_token_centered, _ = chunk_centered_logits[idx]
@@ -900,6 +915,8 @@ def run_steering_sweep(
                 chunk_log_probs_base = metrics.compute_continuation_log_prob_batched(logits_base, chunk_cont_info)
                 # Compute centered logits for baseline
                 chunk_centered_logits_base = steering.compute_per_token_centered_logits_batched(logits_base, chunk_cont_info)
+                # Compute mean target logits/probs for baseline
+                chunk_target_logits_probs_base = metrics.compute_mean_target_logit_and_prob_batched(logits_base, chunk_cont_info)
 
                 for eps_idx, eps in enumerate(epsilons, start=1):
                     if logger:
@@ -911,6 +928,8 @@ def run_steering_sweep(
                     chunk_log_probs = metrics.compute_continuation_log_prob_batched(logits, chunk_cont_info)
                     # Compute centered logits for steered pass
                     chunk_centered_logits = steering.compute_per_token_centered_logits_batched(logits, chunk_cont_info)
+                    # Compute mean target logits/probs for steered pass
+                    chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
                     for local_idx, (branch, cont_ids, cont_start, _, meta) in enumerate(chunk_meta_info):
                         log_P = chunk_log_probs[local_idx]
@@ -932,6 +951,14 @@ def run_steering_sweep(
                         _, mean_centered_logit_original = chunk_centered_logits_base[local_idx]
                         centered_logits_steered[steer_c][eps].append(mean_centered_logit_steered)
                         centered_logits_original[steer_c][eps].append(mean_centered_logit_original)
+
+                        # Track mean target logits/probs
+                        mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[local_idx]
+                        mean_target_logit_original, mean_target_prob_original = chunk_target_logits_probs_base[local_idx]
+                        target_logits_steered[steer_c][eps].append(mean_target_logit_steered)
+                        target_logits_original[steer_c][eps].append(mean_target_logit_original)
+                        target_probs_steered[steer_c][eps].append(mean_target_prob_steered)
+                        target_probs_original[steer_c][eps].append(mean_target_prob_original)
 
                         if log_details:
                             per_token_centered_steered, _ = chunk_centered_logits[local_idx]
@@ -968,7 +995,11 @@ def run_steering_sweep(
         log_probs_steered=log_probs_steered,
         log_probs_original=log_probs_original,
         centered_logits_steered=centered_logits_steered,
-        centered_logits_original=centered_logits_original
+        centered_logits_original=centered_logits_original,
+        target_logits_steered=target_logits_steered,
+        target_logits_original=target_logits_original,
+        target_probs_steered=target_probs_steered,
+        target_probs_original=target_probs_original,
     )
 
     result = {
@@ -1062,6 +1093,10 @@ def run_steering_sweep_prefix_batch(
         log_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
         centered_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
         centered_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
 
         per_prefix[prefix_id] = {
             "decoder_cache": decoder_cache,
@@ -1074,6 +1109,10 @@ def run_steering_sweep_prefix_batch(
             "log_probs_original": log_probs_original,
             "centered_logits_steered": centered_logits_steered,
             "centered_logits_original": centered_logits_original,
+            "target_logits_steered": target_logits_steered,
+            "target_logits_original": target_logits_original,
+            "target_probs_steered": target_probs_steered,
+            "target_probs_original": target_probs_original,
         }
         if log_details:
             detailed_logs_by_prefix[prefix_id] = []
@@ -1116,6 +1155,8 @@ def run_steering_sweep_prefix_batch(
                     "cont_start": cont_start,
                     "baseline": meta["log_P_original"],
                     "baseline_mean_centered_logit": meta.get("mean_centered_logit_original", 0.0),
+                    "baseline_mean_target_logit": meta.get("mean_target_logit_original", 0.0),
+                    "baseline_mean_target_prob": meta.get("mean_target_prob_original", 0.0),
                     "features": features,
                     "decoder_cache": c_decoder_cache,
                 })
@@ -1143,6 +1184,7 @@ def run_steering_sweep_prefix_batch(
             chunk_cont_info = [(it["cont_ids"], it["cont_start"]) for it in chunk_items]
             chunk_log_probs = metrics.compute_continuation_log_prob_batched(logits, chunk_cont_info)
             chunk_centered_logits = steering.compute_per_token_centered_logits_batched(logits, chunk_cont_info)
+            chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
             for idx, (item, log_P) in enumerate(zip(chunk_items, chunk_log_probs)):
                 prefix_id = item["prefix_id"]
@@ -1165,6 +1207,12 @@ def run_steering_sweep_prefix_batch(
                 info["centered_logits_steered"][c_id][eps].append(mean_centered_logit_steered)
                 info["centered_logits_original"][c_id][eps].append(item["baseline_mean_centered_logit"])
 
+                mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[idx]
+                info["target_logits_steered"][c_id][eps].append(mean_target_logit_steered)
+                info["target_logits_original"][c_id][eps].append(item.get("baseline_mean_target_logit", 0.0))
+                info["target_probs_steered"][c_id][eps].append(mean_target_prob_steered)
+                info["target_probs_original"][c_id][eps].append(item.get("baseline_mean_target_prob", 0.0))
+
                 if log_details:
                     per_token_centered, _ = chunk_centered_logits[idx]
                     detailed_logs_by_prefix[prefix_id].append({
@@ -1179,6 +1227,10 @@ def run_steering_sweep_prefix_batch(
                         "mean_centered_logit_steered": float(mean_centered_logit_steered),
                         "mean_centered_logit_original": float(item["baseline_mean_centered_logit"]),
                         "per_token_centered_logits_steered": per_token_centered,
+                        "mean_target_logit_steered": float(mean_target_logit_steered),
+                        "mean_target_logit_original": float(item.get("baseline_mean_target_logit", 0.0)),
+                        "mean_target_prob_steered": float(mean_target_prob_steered),
+                        "mean_target_prob_original": float(item.get("baseline_mean_target_prob", 0.0)),
                     })
 
             del logits, chunk_log_probs
@@ -1193,6 +1245,10 @@ def run_steering_sweep_prefix_batch(
             log_probs_original=info["log_probs_original"],
             centered_logits_steered=info["centered_logits_steered"],
             centered_logits_original=info["centered_logits_original"],
+            target_logits_steered=info["target_logits_steered"],
+            target_logits_original=info["target_logits_original"],
+            target_probs_steered=info["target_probs_steered"],
+            target_probs_original=info["target_probs_original"],
         )
         if log_details:
             result["detailed_logs"] = detailed_logs_by_prefix.get(prefix_id, [])
@@ -1212,6 +1268,7 @@ def run_sweep_mode(
     device: torch.device,
     logger,
     cross_prefix_batching: bool,
+    K_clamp: int = None,
 ):
     """Run sweep mode - iterate over multiple configurations."""
     max_cluster_samples = args.max_cluster_samples if args.max_cluster_samples is not None else steering_config.get("max_cluster_samples", 30)
@@ -1319,12 +1376,15 @@ def run_sweep_mode(
 
             grid_results = clustering_sweep.get("grid", [])
 
-            # Get K_max from sweep config (default 20)
+            # Get K_clamp for downstream filtering
+            # Priority: CLI arg > config > sweep_config K_clamp > sweep_config K_max > default 20
             sweep_config = clustering_sweep.get("sweep_config", {})
-            K_max = sweep_config.get("K_max", 20)
+            effective_K_clamp = K_clamp if K_clamp is not None else sweep_config.get(
+                "K_clamp", sweep_config.get("K_max", 20)
+            )
 
-            # Filter: valid entries with intermediate K (1 < K < K_max).
-            # We skip degenerate clusterings (K<=1) and boundary solutions (K>=K_max).
+            # Filter: valid entries with K in range (1, K_clamp].
+            # We skip degenerate clusterings (K<=1) and those exceeding K_clamp.
             valid_grid = []
             skipped_by_K = []
             for entry in grid_results:
@@ -1333,14 +1393,14 @@ def run_sweep_mode(
                 K = entry.get("K", len(entry.get("components", {})))
                 if K is None:
                     continue
-                if K <= 1 or K >= K_max:
+                if K <= 1 or K > effective_K_clamp:
                     skipped_by_K.append((entry.get("beta"), entry.get("gamma"), K))
                     continue
                 valid_grid.append(entry)
 
             if skipped_by_K:
                 logger.info(
-                    f"  Skipped {len(skipped_by_K)} configs outside (1, {K_max}) for K: "
+                    f"  Skipped {len(skipped_by_K)} configs outside (1, {effective_K_clamp}] for K: "
                     f"{skipped_by_K[:3]}{'...' if len(skipped_by_K) > 3 else ''}"
                 )
 
@@ -1742,6 +1802,8 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Quiet mode")
     parser.add_argument("--cross-prefix-batching", action="store_true",
                         help="Enable heterogeneous batching across clusters/prefixes")
+    parser.add_argument("--K-clamp", type=int, default=None,
+                        help="Maximum K for downstream steering (filters out K > K_clamp)")
 
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1773,6 +1835,9 @@ def main():
     max_samples = args.max_samples if args.max_samples is not None else steering_config.get("max_samples")
     cross_prefix_batching = args.cross_prefix_batching or steering_config.get("cross_prefix_batching", False)
     h_c_strategy = "H_c"
+    
+    # K_clamp for downstream filtering (CLI overrides config)
+    K_clamp = args.K_clamp if args.K_clamp is not None else steering_config.get("K_clamp", None)
 
     if args.hypotheses is not None:
         hypotheses = [h.upper() for h in args.hypotheses]
@@ -1817,6 +1882,7 @@ def main():
         device=device,
         logger=logger,
         cross_prefix_batching=cross_prefix_batching,
+        K_clamp=K_clamp,
     )
     logger.info("SWEEP MODE COMPLETE")
     return

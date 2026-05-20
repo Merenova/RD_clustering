@@ -86,7 +86,7 @@ for i in "${!TAGS[@]}"; do
   out_dir="$ROOT_DIR/$tag"
   mkdir -p "$out_dir/results" "$out_dir/logs"
 
-  bash "$SCRIPT_DIR/run_pipeline.sh" --output_dir "$out_dir" --config "$config"
+  CONFIG_FILE="$config" bash "$SCRIPT_DIR/run_pipeline.sh" --output_dir "$out_dir"
 done
 
 echo "All requested combos finished."

@@ -34,6 +34,13 @@ from utils.logging_utils import setup_logger
 from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
 
 
+def _resolve_backend(model_name: str, backend_arg: str) -> str:
+    """Pick the ReplacementModel backend. 'auto' picks nnsight for Gemma3."""
+    if backend_arg != "auto":
+        return backend_arg
+    return "nnsight" if "gemma-3" in model_name.lower() else "transformerlens"
+
+
 def aggregate_attributions(
     token_attrs: List[ContinuationTokenAttribution],
     start: int,
@@ -92,21 +99,17 @@ def process_prefix(
 
     # Collect all continuations from branch sampling results
     all_continuations = []
-    continuation_metadata = []  # Track which first_token/continuation each belongs to
+    continuation_metadata = []
 
-    for ft_idx, ft_data in enumerate(branches_data["first_tokens"]):
-        first_token_id = ft_data["token_id"]
-
-        for cont_idx, cont in enumerate(ft_data["continuations"]):
-            # Continuation is: [first_token] + cont["token_ids"]
-            full_continuation = [first_token_id] + cont["token_ids"]
-            all_continuations.append(full_continuation)
-            continuation_metadata.append({
-                "first_token_idx": ft_idx,
-                "first_token_id": first_token_id,
-                "continuation_idx": cont_idx,
-                "text": ft_data["token_text"] + cont["text"],
-            })
+    for cont_idx, cont in enumerate(branches_data.get("continuations", [])):
+        cont_tokens = cont.get("token_ids", [])
+        if not cont_tokens:
+            continue
+        all_continuations.append(cont_tokens)
+        continuation_metadata.append({
+            "continuation_idx": cont_idx,
+            "text": cont.get("text", ""),
+        })
 
     n_continuations = len(all_continuations)
     logger.info(f"  Total continuations: {n_continuations}")
@@ -287,6 +290,12 @@ def main():
         action="store_true",
         help="Quiet mode (only progress bars)"
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "transformerlens", "nnsight"],
+        default="auto",
+        help="ReplacementModel backend. 'auto' picks nnsight for Gemma3 models.",
+    )
     args = parser.parse_args()
 
     # Setup paths
@@ -329,7 +338,9 @@ def main():
     logger.info(f"Loaded branches index: {len(branches_index['output_files'])} prefixes")
 
     # Filter by Stage 2 manifest
-    results_dir = paths.results
+    # Derive results_dir from branches_dir to respect --output-dir
+    # branches_dir is typically {output_dir}/results/2_branch_sampling/
+    results_dir = args.branches_dir.parent
     all_prefix_ids = []
     branches_files = {}
 
@@ -375,8 +386,19 @@ def main():
         "bfloat16": torch.bfloat16,
     }
     model_dtype = dtype_map[args.dtype]
-    model = ReplacementModel.from_pretrained(args.model, args.transcoder, dtype=model_dtype)
-    logger.info("ReplacementModel initialized")
+
+    backend = _resolve_backend(args.model, args.backend)
+    logger.info("Using backend=%s for model=%s", backend, args.model)
+
+    if backend == "nnsight":
+        from circuit_tracer.attribution._nnsight_overlay import (
+            get_nnsight_replacement_model_cls,
+        )
+        NN = get_nnsight_replacement_model_cls()
+        model = NN.from_pretrained(args.model, args.transcoder, dtype=model_dtype)
+    else:
+        model = ReplacementModel.from_pretrained(args.model, args.transcoder, dtype=model_dtype)
+    logger.info("ReplacementModel initialized (backend=%s)", backend)
 
     # Process each prefix
     logger.info("\n" + "=" * 60)

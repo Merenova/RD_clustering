@@ -15,7 +15,6 @@ Key APIs we lean on from NNSightReplacementModel (sibling repo at
 
 from __future__ import annotations
 
-import inspect
 import logging
 
 import numpy as np
@@ -28,28 +27,36 @@ logger = logging.getLogger("attribution.nnsight")
 
 
 def _compute_attribution_components(transcoders, mlp_in_tensor, zero_positions):
+    """Call transcoders.compute_attribution_components with whichever signature
+    is exposed.
+
+    The in-tree TranscoderSet takes only ``mlp_inputs``; the sibling repo's
+    version accepts an additional ``zero_positions`` slice. When the model is
+    loaded via nnsight's envoy, ``inspect.signature`` reports a generic
+    ``(*args, **kwargs)`` forwarder and cannot tell the two apart, so we try
+    the richer calls first and fall back on signature-mismatch ``TypeError``s
+    only. In-body ``TypeError``s (raised from within the function) propagate.
+    """
     compute = transcoders.compute_attribution_components
-    signature = inspect.signature(compute)
-    parameters = signature.parameters
-    zero_param = parameters.get("zero_positions")
 
-    if zero_param is not None:
-        if zero_param.kind is inspect.Parameter.KEYWORD_ONLY:
-            return compute(mlp_in_tensor, zero_positions=zero_positions)
+    def _is_signature_error(err: TypeError) -> bool:
+        msg = str(err)
+        return (
+            "unexpected keyword argument" in msg
+            or "positional argument" in msg
+            or "positional arguments" in msg
+        )
+
+    try:
+        return compute(mlp_in_tensor, zero_positions=zero_positions)
+    except TypeError as e:
+        if not _is_signature_error(e):
+            raise
+    try:
         return compute(mlp_in_tensor, zero_positions)
-
-    if any(param.kind is inspect.Parameter.VAR_POSITIONAL for param in parameters.values()):
-        return compute(mlp_in_tensor, zero_positions)
-
-    positional_params = [
-        param
-        for param in parameters.values()
-        if param.kind
-        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    if len(positional_params) >= 2:
-        return compute(mlp_in_tensor, zero_positions)
-
+    except TypeError as e:
+        if not _is_signature_error(e):
+            raise
     return compute(mlp_in_tensor)
 
 

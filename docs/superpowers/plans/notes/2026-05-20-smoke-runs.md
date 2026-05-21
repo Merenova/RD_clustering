@@ -45,3 +45,23 @@
 - Stage 2 wall time per sample: ~185s for 500 continuations; for 200 samples expect ~10h for Stage 2 alone.
 - Stage 3 wall time per sample: ~135s; for 200 samples expect ~7.5h for Stage 3 alone.
 - Consider lowering `max_total_continuations` or using `--skip-existing` for incremental reruns.
+
+
+## Post-fix D1/D2 verification (2026-05-21)
+
+- Unit tests:
+  - `uv run pytest tests/test_question_dataset_selection.py -q`: PASS
+  - `uv run pytest circuit-tracer/tests/test_nnsight_prefix_regressions.py -q`: PASS
+- HarmBench Stage 1:
+  - Command: `CONFIG_FILE=configs/harmbench_Qwen3_8B_config.json bash scripts/run_pipeline.sh --output_dir /tmp/check_harmbench_stage1_fixed --only 1 --quiet`
+  - Status: PASS
+  - Samples: 200
+- MMLU Gemma3 Stage 1:
+  - Command: `CONFIG_FILE=configs/gemma3_1b_it_mmlu_config.json bash scripts/run_pipeline.sh --output_dir /tmp/check_mmlu_gemma_stage1_fixed --only 1 --quiet`
+  - Status: PASS
+  - Samples: 200
+- HarmBench Gemma3-1B-it Stage 2+3:
+  - Output: `/tmp/smoke_harmbench_gemma3_1b_fixed/results/3_attribution_graphs/cloze_0000_prefix_context.pt`
+  - Status: PASS
+  - Verified: Gemma3 zero positions 0-3 max absolute error is 0.0.
+  - Verified: attribution block max absolute values after `max_feature_nodes=4096`: feature=22.0, error=628.0, token=1.1953125.

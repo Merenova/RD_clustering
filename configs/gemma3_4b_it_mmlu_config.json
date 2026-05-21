@@ -7,7 +7,7 @@
   },
   "data": {
     "cloze_dir": "data/mmlu_cais_validation_selected",
-    "split": "train",
+    "split": "validation",
     "raw_cloze_dir": "data/raw_clozes"
   },
   "stage_0_preprocess": {

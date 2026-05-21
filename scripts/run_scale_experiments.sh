@@ -22,13 +22,12 @@ HarmBench_Gemma3-4B-it     configs/gemma3_4b_it_harmbench_config.json   data/har
 
 ensure_harmbench_prepped() {
   local cloze_dir="$1"
-  if [[ -f "$cloze_dir/test_clozes.json" ]]; then
+  if [[ -f "$cloze_dir/dataset_dict.json" ]]; then
     return 0
   fi
-  echo ">>> Preparing HarmBench data at $cloze_dir"
+  echo ">>> Preparing HarmBench DatasetDict at $cloze_dir"
   uv run python scripts/prepare_harmbench_questions.py \
-    --model Qwen/Qwen3-8B \
-    --output "$cloze_dir/test_clozes.json"
+    --save-dir "$cloze_dir"
 }
 
 ONLY=""

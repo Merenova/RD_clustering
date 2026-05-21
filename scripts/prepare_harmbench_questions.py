@@ -1,18 +1,21 @@
 #!/usr/bin/env -S uv run python
-"""Pull walledai/HarmBench and emit pipeline-ready prompts as test_clozes.json.
+"""Prepare walledai/HarmBench for latent_planning Stage 1.
 
-Mirrors scripts/prepare_mmlu_questions.py for shape compatibility with Stage 2.
+The pipeline's Stage 1 expects `data.cloze_dir` to be a HuggingFace
+DatasetDict loaded by `datasets.load_from_disk`. This script saves raw
+HarmBench behavior prompts in that format. It can also emit a legacy
+pipeline-shaped JSON sample for quick manual inspection when `--output` is
+provided.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,41 +40,65 @@ def apply_chat_template(question: str, tokenizer) -> str:
         )
 
 
-def build_samples(
+def _first_nonempty(row: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def build_dataset_rows(
     rows: List[dict],
-    tokenizer,
     prompt_col: str,
     category_col: str | None,
     id_col: str | None,
     source_split: str,
 ) -> list[dict]:
+    out = []
+    for idx, row in enumerate(rows):
+        question = str(row[prompt_col])
+        category = str(row[category_col]) if category_col and category_col in row else "unknown"
+        original_id = str(row[id_col]) if id_col and id_col in row else f"harmbench_{idx:04d}"
+        out.append(
+            {
+                "id": original_id,
+                "question": question,
+                "prompt": question,
+                "category": category,
+                "source_dataset": "walledai/HarmBench",
+                "source_split": source_split,
+            }
+        )
+    return out
+
+
+def build_json_samples(rows: list[dict], tokenizer) -> list[dict]:
     samples = []
     for idx, row in enumerate(rows):
-        text = str(row[prompt_col])
-        category = str(row[category_col]) if category_col and category_col in row else "unknown"
-        if id_col and id_col in row:
-            original_id = str(row[id_col])
-        else:
-            original_id = f"harmbench_{idx:04d}"
-        samples.append({
-            "cloze_id": f"cloze_{idx:04d}",
-            "group_id": f"group_{idx:04d}",
-            "prefix": apply_chat_template(text, tokenizer),
-            "target": "",
-            "category": category,
-            "subject": category,
-            "original_id": original_id,
-            "question": text,
-            "cloze": text,
-            "cloze_type": "main",
-            "mode": "question",
-            "choices": [],
-            "answer_index": -1,
-            "answer_letter": "",
-            "answer_text": "",
-            "source_dataset": "walledai/HarmBench",
-            "source_split": source_split,
-        })
+        question = row["question"]
+        category = row["category"]
+        samples.append(
+            {
+                "cloze_id": f"cloze_{idx:04d}",
+                "group_id": f"group_{idx:04d}",
+                "prefix": apply_chat_template(question, tokenizer),
+                "target": "",
+                "category": category,
+                "subject": category,
+                "original_id": row["id"],
+                "question": question,
+                "cloze": question,
+                "cloze_type": "main",
+                "mode": "question",
+                "choices": [],
+                "answer_index": -1,
+                "answer_letter": "",
+                "answer_text": "",
+                "source_dataset": row["source_dataset"],
+                "source_split": row["source_split"],
+            }
+        )
     return samples
 
 
@@ -80,36 +107,29 @@ def main():
     p.add_argument("--dataset-id", default="walledai/HarmBench")
     p.add_argument("--config-name", default="standard")
     p.add_argument("--split", default="train")
-    p.add_argument("--model", required=True, help="HF model id for tokenizer / chat template")
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--n-samples", type=int, default=None, help="Subsample to N (default: all)")
+    p.add_argument("--save-dir", type=Path, default=None, help="DatasetDict output directory for Stage 1")
+    p.add_argument("--output", type=Path, default=None, help="Optional legacy test_clozes.json output")
+    p.add_argument("--model", default=None, help="HF model id for optional JSON chat template")
+    p.add_argument("--n-samples", type=int, default=None, help="Subsample to N rows before saving")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--prompt-col",
-        default=None,
-        help="Column holding the prompt text (auto-detect if omitted)",
-    )
-    p.add_argument(
-        "--category-col",
-        default=None,
-        help="Column holding the category (auto-detect if omitted)",
-    )
-    p.add_argument(
-        "--id-col",
-        default=None,
-        help="Column holding the behavior id (auto-detect if omitted)",
-    )
+    p.add_argument("--prompt-col", default=None, help="Column holding prompt text")
+    p.add_argument("--category-col", default=None, help="Column holding category")
+    p.add_argument("--id-col", default=None, help="Column holding behavior id")
     args = p.parse_args()
+
+    if args.save_dir is None and args.output is None:
+        raise SystemExit("Provide --save-dir for Stage 1 data, --output for JSON, or both")
+    if args.output is not None and args.model is None:
+        raise SystemExit("--output requires --model so the JSON prompt uses the right chat template")
 
     log = setup_logger("prepare_harmbench")
     log.info("Loading %s/%s split=%s", args.dataset_id, args.config_name, args.split)
     ds = load_dataset(args.dataset_id, args.config_name, split=args.split)
     log.info("Loaded %d rows; columns=%s", len(ds), ds.column_names)
 
-    # Auto-detect columns
-    # walledai/HarmBench standard has: prompt, category (no id column)
     prompt_col = args.prompt_col or next(
-        (c for c in ["prompt", "behavior", "Behavior"] if c in ds.column_names), None
+        (c for c in ["prompt", "behavior", "Behavior", "question"] if c in ds.column_names),
+        None,
     )
     if prompt_col is None:
         raise SystemExit(f"Cannot find prompt column in {ds.column_names}")
@@ -127,42 +147,45 @@ def main():
         ),
         None,
     )
+    id_col = args.id_col or next((c for c in ["BehaviorID", "id"] if c in ds.column_names), None)
+    log.info("prompt_col=%s category_col=%s id_col=%s", prompt_col, category_col, id_col)
 
-    id_col = args.id_col or next(
-        (c for c in ["BehaviorID", "id"] if c in ds.column_names), None
-    )
-
-    log.info("prompt_col=%s  category_col=%s  id_col=%s", prompt_col, category_col, id_col)
-
-    rows = list(ds)
-    if args.n_samples is not None and args.n_samples < len(rows):
+    source_rows = list(ds)
+    if args.n_samples is not None and args.n_samples < len(source_rows):
         random.seed(args.seed)
-        rows = random.sample(rows, args.n_samples)
-        log.info("Subsampled to %d rows (seed=%d)", len(rows), args.seed)
+        source_rows = random.sample(source_rows, args.n_samples)
+        log.info("Subsampled to %d rows (seed=%d)", len(source_rows), args.seed)
 
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    samples = build_samples(rows, tok, prompt_col, category_col, id_col, args.split)
-
-    payload = {
-        "metadata": {
-            "dataset_id": args.dataset_id,
-            "config_name": args.config_name,
-            "source_dir": str(args.output.parent),
-            "split": args.split,
-            "subjects": [args.config_name],
-            "mode": "question",
-            "prompt_style": "question_only",
-            "total_groups": len(samples),
-            "selected_groups": len(samples),
-            "total_samples": len(samples),
-            "random_seed": args.seed,
-            "model": args.model,
-        },
-        "clozes": samples,
+    rows = build_dataset_rows(source_rows, prompt_col, category_col, id_col, args.split)
+    metadata = {
+        "dataset_id": args.dataset_id,
+        "config_name": args.config_name,
+        "split": args.split,
+        "total_samples": len(rows),
+        "random_seed": args.seed,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_json(payload, args.output)
-    log.info("Wrote %d samples to %s", len(samples), args.output)
+
+    if args.save_dir is not None:
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+        DatasetDict({args.split: Dataset.from_list(rows)}).save_to_disk(str(args.save_dir))
+        save_json(metadata, args.save_dir / "metadata.json")
+        log.info("Saved %d rows as DatasetDict to %s", len(rows), args.save_dir)
+
+    if args.output is not None:
+        tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        samples = build_json_samples(rows, tok)
+        payload = {
+            "metadata": {
+                **metadata,
+                "mode": "question",
+                "prompt_style": "question_only",
+                "model": args.model,
+            },
+            "clozes": samples,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        save_json(payload, args.output)
+        log.info("Wrote %d JSON samples to %s", len(samples), args.output)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,10 @@ Key APIs we lean on from NNSightReplacementModel (sibling repo at
     - model.embed_weight (replacement for TL's W_E)
     - model.cfg.device / model.cfg.n_layers
 """
+
 from __future__ import annotations
 
+import inspect
 import logging
 
 import numpy as np
@@ -23,6 +25,32 @@ from nnsight import save as _nnsight_save  # type: ignore
 from .context import PrefixAttributionContext
 
 logger = logging.getLogger("attribution.nnsight")
+
+
+def _compute_attribution_components(transcoders, mlp_in_tensor, zero_positions):
+    compute = transcoders.compute_attribution_components
+    signature = inspect.signature(compute)
+    parameters = signature.parameters
+    zero_param = parameters.get("zero_positions")
+
+    if zero_param is not None:
+        if zero_param.kind is inspect.Parameter.KEYWORD_ONLY:
+            return compute(mlp_in_tensor, zero_positions=zero_positions)
+        return compute(mlp_in_tensor, zero_positions)
+
+    if any(param.kind is inspect.Parameter.VAR_POSITIONAL for param in parameters.values()):
+        return compute(mlp_in_tensor, zero_positions)
+
+    positional_params = [
+        param
+        for param in parameters.values()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional_params) >= 2:
+        return compute(mlp_in_tensor, zero_positions)
+
+    return compute(mlp_in_tensor)
 
 
 @torch.no_grad()
@@ -68,15 +96,16 @@ def setup_prefix_context(prefix_ids: torch.Tensor, model) -> PrefixAttributionCo
     mlp_in_tensor = getattr(mlp_in_cache, "value", mlp_in_cache)
     mlp_out_tensor = getattr(mlp_out_cache, "value", mlp_out_cache)
 
-    # --- Transcoder decomposition -------------------------------------------
-    # Sibling repo's compute_attribution_components accepts an optional
-    # `zero_positions` kwarg (default slice(0, 1)); match the TL call which
-    # uses the default.
-    attribution_data = model.transcoders.compute_attribution_components(mlp_in_tensor)
+    zero_positions = getattr(model, "zero_positions", slice(0, 1))
+    attribution_data = _compute_attribution_components(
+        model.transcoders,
+        mlp_in_tensor,
+        zero_positions,
+    )
 
     # --- Error vectors -------------------------------------------------------
     error_vectors = mlp_out_tensor - attribution_data["reconstruction"]
-    error_vectors[:, 0] = 0  # Zero first position (BOS artifact) — matches TL.
+    error_vectors[:, zero_positions] = 0
 
     # --- Token embeddings ----------------------------------------------------
     # NNSightReplacementModel exposes the embedding weight as `embed_weight`
@@ -131,6 +160,7 @@ def _make_prefix_only_attribution_context(prefix_ctx: PrefixAttributionContext, 
 
     NNCtx = get_nnsight_attribution_context_cls()
     n_prefix = prefix_ctx.prefix_length
+    feature_count = prefix_ctx.n_prefix_features
 
     class _PrefixOnlyAttributionContext(NNCtx):  # type: ignore[misc, valid-type]
         """nnsight AttributionContext that only reads prefix-position gradients
@@ -139,10 +169,8 @@ def _make_prefix_only_attribution_context(prefix_ctx: PrefixAttributionContext, 
         """
 
         def compute_error_attributions(self, layer, grads):  # type: ignore[override]
-            _, n_pos, _ = self.activation_matrix.shape
-
             def error_offset(lyr: int) -> int:
-                return self.activation_matrix._nnz() + lyr * n_pos
+                return feature_count + lyr * n_prefix
 
             self.compute_score(
                 grads,
@@ -152,16 +180,11 @@ def _make_prefix_only_attribution_context(prefix_ctx: PrefixAttributionContext, 
             )
 
         def compute_token_attributions(self, grads):  # type: ignore[override]
-            n_layers, n_pos, _ = self.activation_matrix.shape
-
-            def error_offset(lyr: int) -> int:
-                return self.activation_matrix._nnz() + lyr * n_pos
-
-            tok_start = error_offset(n_layers)
+            tok_start = feature_count + self.n_layers * n_prefix
             self.compute_score(
                 grads,
                 self.token_vectors,
-                write_index=np.s_[tok_start : tok_start + n_pos],
+                write_index=np.s_[tok_start : tok_start + n_prefix],
                 read_index=np.s_[:, :n_prefix],
             )
 
@@ -177,6 +200,10 @@ def _make_prefix_only_attribution_context(prefix_ctx: PrefixAttributionContext, 
         decoder_locations=prefix_ctx.decoder_locations,
         logits=None,  # Not used for prefix-to-continuation attribution.
     )
+    # Some test/overlay contexts do not initialize n_layers; keep the overridden
+    # token offset tied to the prefix context rather than the activation shape.
+    cont_ctx.n_layers = prefix_ctx.n_layers
+    cont_ctx._row_size = prefix_ctx.n_prefix_sources
     return cont_ctx
 
 
@@ -257,9 +284,7 @@ def attribute_prefix_to_continuations(
                 "activation magnitude"
             )
         activation_values = prefix_ctx.activation_matrix.values()
-        top_indices = torch.argsort(activation_values.abs(), descending=True)[
-            :max_feature_nodes
-        ]
+        top_indices = torch.argsort(activation_values.abs(), descending=True)[:max_feature_nodes]
         top_indices = top_indices.sort().values  # keep original ordering
 
         prefix_ctx = PrefixAttributionContext(

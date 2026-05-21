@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from circuit_tracer.attribution.context import PrefixAttributionContext
@@ -135,6 +136,11 @@ class _FakeTranscoders:
         }
 
 
+class _BoomingTranscoders:
+    def compute_attribution_components(self, mlp_inputs, zero_positions):
+        raise TypeError("internal boom")
+
+
 class _FakeNNSightModel:
     def __init__(self):
         self.device = torch.device("cpu")
@@ -164,3 +170,14 @@ def test_setup_prefix_context_uses_model_zero_positions(monkeypatch):
     assert model.transcoders.seen_zero_positions == slice(0, 4)
     assert torch.all(ctx.error_vectors[:, :4] == 0)
     assert torch.all(ctx.error_vectors[:, 4] != 0)
+
+
+def test_setup_prefix_context_does_not_swallow_internal_transcoder_typeerror(
+    monkeypatch,
+):
+    monkeypatch.setattr(attr_nn, "_nnsight_save", lambda value: value)
+    model = _FakeNNSightModel()
+    model.transcoders = _BoomingTranscoders()
+
+    with pytest.raises(TypeError, match="internal boom"):
+        attr_nn.setup_prefix_context(torch.tensor([0, 1, 2, 3, 4]), model)

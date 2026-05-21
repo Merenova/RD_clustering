@@ -119,6 +119,72 @@ def extract_cloze_groups(split_data: List[Dict], quiet: bool = False) -> List[Di
     return cloze_groups
 
 
+def _first_nonempty(item: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def extract_question_groups(split_data: List[Dict], quiet: bool = False) -> List[Dict]:
+    """Extract one-question groups from MMLU/HarmBench-style datasets.
+
+    These datasets do not have AmbigQA's `final_filter.main_cloze` structure.
+    In question mode we treat each row as a single main question with no sub
+    clozes and let `flatten_groups_to_samples` apply the target model's chat
+    template.
+    """
+    question_groups = []
+
+    iterator = split_data
+    if quiet:
+        from tqdm import tqdm
+        iterator = tqdm(split_data, desc="Extracting question rows")
+
+    for idx, item in enumerate(iterator):
+        question = _first_nonempty(item, ["question", "prompt", "behavior", "Behavior"])
+        if question is None:
+            continue
+
+        category = _first_nonempty(
+            item,
+            [
+                "subject",
+                "category",
+                "FunctionalCategory",
+                "functional_category",
+                "SemanticCategory",
+                "question_type",
+            ],
+        ) or "unknown"
+
+        original_id = _first_nonempty(item, ["id", "BehaviorID", "original_id"])
+        if original_id is None:
+            if "subject" in item and "source_row" in item:
+                original_id = f"{item['subject']}_{item['source_row']}"
+            else:
+                original_id = f"question_{idx:04d}"
+
+        target = _first_nonempty(item, ["answer_text", "target", "answer"]) or ""
+
+        question_groups.append(
+            {
+                "original_id": str(original_id),
+                "category": str(category),
+                "main": {
+                    "question": str(question),
+                    "cloze": str(question),
+                    "prefix": str(question),
+                    "target": str(target),
+                },
+                "subs": [],
+            }
+        )
+
+    return question_groups
+
+
 def flatten_groups_to_samples(
     groups: List[Dict],
     mode: str = "cloze",
@@ -352,7 +418,10 @@ def main():
     # Extract cloze groups (keeping main + subs together)
     logger.info("Extracting cloze groups...")
     cloze_groups = extract_cloze_groups(split_data, quiet=args.quiet)
-    logger.info(f"Found {len(cloze_groups)} cloze groups")
+    if not cloze_groups and args.mode == "question":
+        logger.info("No AmbigQA-style cloze groups found; trying question-row extraction")
+        cloze_groups = extract_question_groups(split_data, quiet=args.quiet)
+    logger.info(f"Found {len(cloze_groups)} cloze/question groups")
 
     # Count total clozes
     total_clozes = sum(1 + len(g["subs"]) for g in cloze_groups)

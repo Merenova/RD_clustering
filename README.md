@@ -1,5 +1,11 @@
 # Latent Planning: Rate-Distortion Clustering
 
+This repository, [Merenova/RD_clustering](https://github.com/Merenova/RD_clustering), is temporary.
+
+Paper: [https://arxiv.org/abs/2606.08236](https://arxiv.org/abs/2606.08236)
+
+The main repository will be uploaded at [Merenova/distribution-level-feature-discovery](https://github.com/Merenova/distribution-level-feature-discovery).
+
 Implementation of **Rate-Distortion two-view clustering** for analyzing semantic-attribution structure in language model continuations. This approach discovers latent semantic components by jointly optimizing over semantic embeddings and attribution features using rate-distortion theory.
 
 ## Overview
